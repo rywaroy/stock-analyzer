@@ -1283,13 +1283,8 @@ ORDER BY stock_code, horizon, window_days
   return app;
 }
 
-if (
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(process.argv[1]).href
-) {
-  const port = 8001;
-  const app = createApp();
-  app.listen(port, () => {
-    console.log(`Stock analysis API listening on http://127.0.0.1:${port}`);
-  });
-}
+const port = 8001;
+const app = createApp();
+app.listen(port, () => {
+  console.log(`Stock analysis API listening on http://127.0.0.1:${port}`);
+});
