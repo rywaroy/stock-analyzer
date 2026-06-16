@@ -13,6 +13,8 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ import stock_fundamental_analysis as sfa
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SCORER_PATH = PROJECT_ROOT / ".codex/skills/stock-buy-signal-analysis/scripts/analyze_stock.py"
+DEFAULT_INGEST_API_TOKEN = "stock-analysis-ingest-2026-6f8c2d91b7a443e0"
 
 
 def number(value: Any) -> float | None:
@@ -782,6 +785,29 @@ def persist_results(results: list[dict[str, Any]], args: argparse.Namespace) -> 
     run_mysql(build_report_sql(results, args.adjust), args, use_database=True)
 
 
+def upload_results(results: list[dict[str, Any]], args: argparse.Namespace, adjust_type: str) -> dict[str, Any]:
+    token = getattr(args, "ingest_token", "") or os.environ.get("INGEST_API_TOKEN", "") or DEFAULT_INGEST_API_TOKEN
+    payload = json.dumps({"adjustType": adjust_type, "results": results}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        getattr(args, "ingest_url"),
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"上报接口返回 {exc.code}：{detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"上报接口请求失败：{exc.reason}") from exc
+    return json.loads(body) if body else {}
+
+
 def render_dry_run_sql(results: list[dict[str, Any]], adjust_type: str) -> str:
     sql = build_persist_sql(results, adjust_type)
     return sql + "\n" + refresh_signal_outcomes_sql() + "\n"
@@ -809,6 +835,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--as-of-date", type=parse_arg_date, help="按指定日期回看分析，只使用该日期及以前的日线数据")
     parser.add_argument("--backfill-from", type=parse_arg_date, help="历史回填起始日期，需与 --backfill-to 同时使用")
     parser.add_argument("--backfill-to", type=parse_arg_date, help="历史回填结束日期，需与 --backfill-from 同时使用")
+    parser.add_argument("--ingest-url", default="", help="通过 Express ingest 接口上报分析结果，传入后不直连本地 MySQL")
+    parser.add_argument("--ingest-token", default="", help="Express ingest 接口 Bearer Token；也可用 INGEST_API_TOKEN")
     parser.add_argument("--dry-run", action="store_true", help="只打印将执行的 SQL，不写库")
     return parser.parse_args(argv)
 
@@ -819,7 +847,9 @@ def main(argv: list[str]) -> int:
         validate_database_name(args.database)
         scorer = load_scorer()
         as_of_dates = requested_as_of_dates(args)
-        if not args.dry_run and not args.skip_schema:
+        if args.dry_run and args.ingest_url:
+            raise ValueError("--dry-run 仅支持本地 MySQL SQL 输出，不能与 --ingest-url 同时使用")
+        if not args.dry_run and not args.ingest_url and not args.skip_schema:
             ensure_schema(args)
         seen_keys: set[tuple[str, str]] = set()
         all_results: list[dict[str, Any]] = []
@@ -836,6 +866,8 @@ def main(argv: list[str]) -> int:
                 continue
             if args.dry_run:
                 dry_run_parts.append(render_dry_run_sql(results, args.adjust))
+            elif args.ingest_url:
+                upload_results(results, run_args, args.adjust)
             else:
                 persist_results(results, run_args)
             all_results.extend(results)

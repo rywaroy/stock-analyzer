@@ -69,7 +69,7 @@ uv run --python 3.12 --with-requirements requirements.txt \
 `--adjust` 可选：`none` 不复权、`qfq` 前复权、`hfq` 后复权。
 长期趋势和 RSI 预热会至少保留 260 根日线；`--technical-days` 大于 260 时会保留更多历史。
 
-## 写入 MySQL
+## 写入 MySQL / 线上接口上报
 
 本地测试库默认是 `stock_analysis_test`，schema 在 `sql/schema.sql`。写入每日数据、评分和最终总结报告：
 
@@ -79,6 +79,26 @@ uv run --python 3.12 --with-requirements requirements.txt \
 ```
 
 `stock-buy-signal-analysis` skill 默认也使用这条完整流程：分析、入库、刷新历史验证、再读取最终报告。
+
+后期切到线上库时，不需要让本地 Python 直连线上 MySQL。把 Express 服务部署到线上并配置 `MYSQL_*` 后，可以通过 ingest 接口上报。默认内置上报 token 是 `stock-analysis-ingest-2026-6f8c2d91b7a443e0`，也可以用服务端环境变量 `INGEST_API_TOKEN` 覆盖。
+
+```bash
+export INGEST_API_TOKEN="stock-analysis-ingest-2026-6f8c2d91b7a443e0"
+
+uv run --python 3.12 --with-requirements requirements.txt \
+  python save_daily_to_mysql.py --ingest-url "https://your-domain.example/api/ingest/daily-analysis"
+```
+
+也可以直接传入 token：
+
+```bash
+uv run --python 3.12 --with-requirements requirements.txt \
+  python save_daily_to_mysql.py "002466" \
+  --ingest-url "https://your-domain.example/api/ingest/daily-analysis" \
+  --ingest-token "stock-analysis-ingest-2026-6f8c2d91b7a443e0"
+```
+
+传入 `--ingest-url` 后，脚本仍在本地完成 AKShare 数据抓取和评分，但不会执行本地 schema 同步或本地 MySQL 写入；它会把结构化分析结果通过 `POST /api/ingest/daily-analysis` 上报给 Express，由服务端完成 MySQL upsert、历史验证刷新和最终报告生成。
 
 也可以临时指定代码覆盖 `stock.md`：
 
@@ -171,6 +191,7 @@ npm run dev
 - Express API 默认运行在 `http://127.0.0.1:3210`
 - VitePress 默认运行在 `http://127.0.0.1:5173`
 - MySQL 默认读取 `stock_analysis_test`，可通过 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 覆盖
+- 上报接口通过 Bearer Token 保护；默认 token 是 `stock-analysis-ingest-2026-6f8c2d91b7a443e0`，可通过 `INGEST_API_TOKEN` 覆盖
 
 常用接口：
 
@@ -178,6 +199,10 @@ npm run dev
 curl http://127.0.0.1:3210/api/dates
 curl "http://127.0.0.1:3210/api/analysis?date=2026-06-12"
 curl "http://127.0.0.1:3210/api/stocks/002466?date=2026-06-12"
+curl -X POST http://127.0.0.1:3210/api/ingest/daily-analysis \
+  -H "Authorization: Bearer $INGEST_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"adjustType":"qfq","results":[]}'
 ```
 
 生产构建：

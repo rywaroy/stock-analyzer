@@ -1,5 +1,6 @@
 import importlib.util
 import datetime as dt
+import json
 import sys
 import tempfile
 import unittest
@@ -839,6 +840,118 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
 
         self.assertNotIn("outcome_inner.status = 'pending'", sql)
         self.assertIn("outcome_inner.signal_close IS NOT NULL", sql)
+
+    def test_upload_results_posts_json_with_bearer_token(self):
+        args = SimpleNamespace(ingest_url="https://stock.example.com/api/ingest/daily-analysis", ingest_token="secret")
+        result = {
+            "code": "002466",
+            "score": 5,
+            "signal": "观望",
+            "raw": {"technical": {"trade_date": "2026-06-12"}},
+        }
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"ok":true,"persistedCount":1}'
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["headers"] = dict(request.header_items())
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            response = mysql_sink.upload_results([result], args, "qfq")
+
+        self.assertEqual(captured["url"], args.ingest_url)
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer secret")
+        self.assertEqual(captured["headers"]["Content-type"], "application/json")
+        self.assertEqual(captured["payload"], {"adjustType": "qfq", "results": [result]})
+        self.assertEqual(captured["timeout"], 60)
+        self.assertEqual(response["persistedCount"], 1)
+
+    def test_upload_results_uses_default_ingest_token(self):
+        args = SimpleNamespace(ingest_url="https://stock.example.com/api/ingest/daily-analysis", ingest_token="")
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"ok":true}'
+
+        def fake_urlopen(request, timeout):
+            captured["headers"] = dict(request.header_items())
+            return FakeResponse()
+
+        with patch.dict("os.environ", {}, clear=True), patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            mysql_sink.upload_results([], args, "qfq")
+
+        self.assertEqual(
+            captured["headers"]["Authorization"],
+            "Bearer stock-analysis-ingest-2026-6f8c2d91b7a443e0",
+        )
+
+    def test_upload_results_reports_http_error_body(self):
+        args = SimpleNamespace(ingest_url="https://stock.example.com/api/ingest/daily-analysis", ingest_token="bad")
+
+        class FakeHttpError(mysql_sink.urllib.error.HTTPError):
+            def read(self):
+                return b'{"error":"unauthorized"}'
+
+        error = FakeHttpError(args.ingest_url, 401, "Unauthorized", {}, None)
+
+        with patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, "401.*unauthorized"):
+                mysql_sink.upload_results([], args, "qfq")
+
+    def test_main_uses_ingest_url_instead_of_local_mysql(self):
+        result = {
+            "code": "002466",
+            "score": 5,
+            "signal": "观望",
+            "confidence": "低",
+            "raw": {"technical": {"trade_date": "2026-06-12"}},
+        }
+        scorer = SimpleNamespace(score_item=lambda item: result)
+
+        with (
+            patch.object(mysql_sink, "load_scorer", return_value=scorer),
+            patch.object(mysql_sink, "fetch_analysis_items", return_value=[{"code": "002466"}]),
+            patch.object(mysql_sink, "ensure_schema") as ensure_schema_mock,
+            patch.object(mysql_sink, "persist_results") as persist_mock,
+            patch.object(mysql_sink, "upload_results", return_value={"ok": True}) as upload_mock,
+        ):
+            exit_code = mysql_sink.main(
+                [
+                    "002466",
+                    "--ingest-url",
+                    "https://stock.example.com/api/ingest/daily-analysis",
+                    "--ingest-token",
+                    "secret",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        ensure_schema_mock.assert_not_called()
+        persist_mock.assert_not_called()
+        upload_mock.assert_called_once()
+        uploaded_results, uploaded_args, adjust_type = upload_mock.call_args.args
+        self.assertEqual(uploaded_results, [result])
+        self.assertEqual(uploaded_args.ingest_token, "secret")
+        self.assertEqual(adjust_type, "qfq")
 
 
 if __name__ == "__main__":
