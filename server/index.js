@@ -103,6 +103,12 @@ export function createApp({
     return `FIELD(${column}, 'short_term', 'medium_term', 'long_term')`;
   }
 
+  function asyncHandler(handler) {
+    return (req, res, next) => {
+      Promise.resolve(handler(req, res, next)).catch(next);
+    };
+  }
+
   function mapDateSummary(row) {
     return {
       tradeDate: row.tradeDate,
@@ -926,20 +932,20 @@ ORDER BY stock_code, horizon, window_days
     }
   }
 
-  app.get("/api/health", async (_req, res) => {
+  app.get("/api/health", asyncHandler(async (_req, res) => {
     const [rows] = await pool.query("SELECT 1 AS ok");
     res.json({
       ok: rows[0]?.ok === 1,
       database: process.env.MYSQL_DATABASE || "stock_analysis_test",
     });
-  });
+  }));
 
-  app.get("/api/dates", async (_req, res) => {
+  app.get("/api/dates", asyncHandler(async (_req, res) => {
     const dates = await loadDateSummaries();
     res.json({ dates });
-  });
+  }));
 
-  app.get("/api/analysis", async (req, res) => {
+  app.get("/api/analysis", asyncHandler(async (req, res) => {
     const summaries = await loadDateSummaries();
     const tradeDate = req.query.date
       ? validateTradeDate(String(req.query.date))
@@ -1005,9 +1011,9 @@ ORDER BY stock_code, horizon, window_days
       summary: summaries.find((item) => item.tradeDate === tradeDate) || null,
       items: rows.map(mapAnalysisItem),
     });
-  });
+  }));
 
-  app.get("/api/stocks/:code", async (req, res) => {
+  app.get("/api/stocks/:code", asyncHandler(async (req, res) => {
     const stockCode = validateStockCode(req.params.code);
     const tradeDate = req.query.date
       ? validateTradeDate(String(req.query.date))
@@ -1194,9 +1200,9 @@ ORDER BY stock_code, horizon, window_days
       history: historyRows,
       accuracySummary: accuracyRows,
     });
-  });
+  }));
 
-  app.get("/api/stocks/:code/history", async (req, res) => {
+  app.get("/api/stocks/:code/history", asyncHandler(async (req, res) => {
     const stockCode = validateStockCode(req.params.code);
     const [rows] = await pool.query(
       `
@@ -1215,12 +1221,12 @@ ORDER BY stock_code, horizon, window_days
       [stockCode],
     );
     res.json({ stockCode, history: rows });
-  });
+  }));
 
   app.post(
     "/api/ingest/daily-analysis",
     requireIngestAuth(ingestToken),
-    async (req, res) => {
+    asyncHandler(async (req, res) => {
       const adjustType = req.body?.adjustType || "qfq";
       const results = Array.isArray(req.body?.results)
         ? req.body.results
@@ -1258,7 +1264,7 @@ ORDER BY stock_code, horizon, window_days
           confidence: result.confidence,
         })),
       });
-    },
+    }),
   );
 
   const distPath = path.join(projectRootPath, "docs/.vitepress/dist");
@@ -1283,8 +1289,10 @@ ORDER BY stock_code, horizon, window_days
   return app;
 }
 
-const port = 8001;
-const app = createApp();
-app.listen(port, () => {
-  console.log(`Stock analysis API listening on http://127.0.0.1:${port}`);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const port = Number(process.env.PORT || process.env.STOCK_DASHBOARD_PORT || 8001);
+  const app = createApp();
+  app.listen(port, () => {
+    console.log(`Stock analysis API listening on http://127.0.0.1:${port}`);
+  });
+}

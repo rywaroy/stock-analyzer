@@ -135,6 +135,7 @@ async function postJson(server, path, body, headers = {}) {
       ...headers,
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(1000),
   });
   return {
     status: response.status,
@@ -193,6 +194,22 @@ test('POST /api/ingest/daily-analysis accepts the built-in default token', async
 
     assert.equal(response.status, 200);
     assert.equal(response.body.persistedCount, 1);
+  });
+});
+
+test('POST /api/ingest/daily-analysis returns 400 for invalid adjustType', async () => {
+  const app = createApp({ pool: createFakePool(), projectRootPath: '/tmp/no-static-dist' });
+
+  await withServer(app, async (server) => {
+    const response = await postJson(
+      server,
+      '/api/ingest/daily-analysis',
+      { adjustType: 'bad', results: [] },
+      { authorization: `Bearer ${DEFAULT_TOKEN}` },
+    );
+
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error, 'adjustType 只支持 none/qfq/hfq');
   });
 });
 
