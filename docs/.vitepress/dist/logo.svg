@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" role="img" aria-label="stock analysis">
+  <rect width="48" height="48" rx="8" fill="#1f2937"/>
+  <path d="M10 34h28" stroke="#f9fafb" stroke-width="2" stroke-linecap="round"/>
+  <path d="M12 29l7-8 6 5 10-13" fill="none" stroke="#34d399" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="19" cy="21" r="2.5" fill="#fbbf24"/>
+  <circle cx="25" cy="26" r="2.5" fill="#fb7185"/>
+</svg>

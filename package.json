@@ -1,0 +1,29 @@
+{
+  "name": "stock-analysis-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "api:dev": "node --watch server/index.js",
+    "docs:dev": "vitepress dev docs --host 0.0.0.0",
+    "dev": "concurrently -n api,docs -c cyan,green \"npm:api:dev\" \"npm:docs:dev\"",
+    "build": "vitepress build docs",
+    "preview": "vitepress preview docs --host 0.0.0.0",
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "@ant-design/icons-vue": "^7.0.1",
+    "ant-design-vue": "^4.2.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "echarts": "^5.5.1",
+    "express": "^4.19.2",
+    "markdown-it": "^14.1.0",
+    "mysql2": "^3.11.5",
+    "vitepress": "^1.6.4",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

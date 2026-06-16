@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stock Buy Signal Analysis"
+  short_description: "基于基本面、技术趋势、择时信号和历史验证的A股分周期买卖评分分析助手"
+  default_prompt: "Use $stock-buy-signal-analysis to run the full A-share analysis pipeline for 002466: analyze, persist to MySQL, refresh historical validation, and summarize the final report."
