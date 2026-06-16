@@ -418,6 +418,26 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertEqual(info["总股本"], 1713218321)
         get_mock.assert_called_once()
 
+    def test_compact_eastmoney_snapshot_retries_transient_proxy_disconnects(self):
+        response = SimpleNamespace(
+            json=lambda: {
+                "rc": 0,
+                "data": {
+                    "f43": 12.3,
+                    "f57": "000001",
+                    "f58": "平安银行",
+                },
+            }
+        )
+
+        with (
+            patch("requests.get", side_effect=[RuntimeError("proxy closed"), RuntimeError("proxy closed"), response]),
+            patch("time.sleep"),
+        ):
+            snapshot = sfa.eastmoney_stock_snapshot("000001")
+
+        self.assertEqual(snapshot["名称"], "平安银行")
+
     def test_fetch_spot_snapshot_uses_compact_eastmoney_snapshot_for_requested_codes(self):
         response = SimpleNamespace(
             json=lambda: {
@@ -444,6 +464,42 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertEqual(spot["002466"]["名称"], "天齐锂业")
         self.assertEqual(spot["002466"]["市盈率-动态"], 14.7)
         self.assertEqual(spot["002466"]["换手率"], 4.64)
+
+    def test_build_analysis_reuses_spot_snapshot_info_without_second_eastmoney_request(self):
+        spot = {
+            "002466": {
+                "名称": "天齐锂业",
+                "股票简称": "天齐锂业",
+                "行业": "能源金属",
+                "上市时间": 20100831,
+                "最新价": 64.38,
+                "最新": 64.38,
+                "总市值": 110296995505.98,
+                "流通市值": 95007110798.1,
+                "总股本": 1713218321,
+                "流通股": 1475723995,
+                "市盈率-动态": 14.7,
+                "市净率": 2.38,
+                "换手率": 4.64,
+                "量比": 1.0,
+            }
+        }
+
+        with (
+            patch.object(sfa, "fetch_individual_info", return_value=({}, "不应调用")) as individual_mock,
+            patch.object(sfa, "fetch_financial_indicator", return_value=({}, "", None)),
+            patch.object(
+                sfa,
+                "fetch_technical_snapshot",
+                return_value=(sfa.TechnicalSnapshot(trade_date="2026-06-15"), None, None),
+            ),
+        ):
+            analysis = sfa.build_analysis(SimpleNamespace(), "002466", "2021", spot, 260, "qfq")
+
+        individual_mock.assert_not_called()
+        self.assertEqual(analysis.name, "天齐锂业")
+        self.assertEqual(analysis.industry, "能源金属")
+        self.assertEqual(analysis.valuation["市盈率-动态"], 14.7)
 
     def test_mysql_text_literal_uses_base64_encoding(self):
         literal = mysql_sink.sql_text("紫金's")
@@ -728,7 +784,7 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         with patch.object(mysql_sink, "query_mysql", side_effect=fake_query_mysql):
             summary = mysql_sink.fetch_evaluation_summaries(args, ["002466"], "qfq")
 
-        self.assertIn("(signal_score >= 50 OR signal_score <= -50)", captured["sql"])
+        self.assertIn("(signal_score > 70 OR signal_score < -70)", captured["sql"])
         self.assertEqual(summary["002466"]["short_term"][5]["sample_count"], 12)
         self.assertEqual(summary["002466"]["short_term"][5]["hit_rate_pct"], 60.0)
 

@@ -702,7 +702,7 @@ FROM stock_signal_outcome
 WHERE status = 'matured'
   AND adjust_type = {sql_text(adjust_type)}
   AND stock_code IN ({code_list})
-  AND (signal_score >= 50 OR signal_score <= -50)
+  AND (signal_score > 70 OR signal_score < -70)
 GROUP BY stock_code, horizon, window_days
 ORDER BY stock_code, horizon, window_days;
 """

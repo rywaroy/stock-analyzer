@@ -11,6 +11,7 @@ import json
 import math
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -847,19 +848,39 @@ EASTMONEY_STOCK_FIELDS = ",".join(
     ]
 )
 
+EASTMONEY_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+    ),
+    "Referer": "https://quote.eastmoney.com/",
+}
 
-def eastmoney_stock_snapshot(code: str, timeout: float = 10) -> dict[str, Any]:
-    response = requests.get(
-        "https://push2.eastmoney.com/api/qt/stock/get",
-        params={
-            "fltt": "2",
-            "invt": "2",
-            "fields": EASTMONEY_STOCK_FIELDS,
-            "secid": f"{1 if code.startswith('6') else 0}.{code}",
-        },
-        timeout=timeout,
-    )
-    data = response.json()
+
+def eastmoney_stock_snapshot(code: str, timeout: float = 10, max_retries: int = 3) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(
+                "https://push2.eastmoney.com/api/qt/stock/get",
+                params={
+                    "fltt": "2",
+                    "invt": "2",
+                    "fields": EASTMONEY_STOCK_FIELDS,
+                    "secid": f"{1 if code.startswith('6') else 0}.{code}",
+                },
+                headers=EASTMONEY_HEADERS,
+                timeout=timeout,
+            )
+            data = response.json()
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                time.sleep(1 + attempt)
+    else:
+        raise last_error or RuntimeError(f"东财个股快照请求失败：{code}")
+
     row = data.get("data") or {}
     if data.get("rc") != 0 or not row:
         raise ValueError(f"东财个股快照为空：{code}")
@@ -1030,7 +1051,11 @@ def build_analysis(
 ) -> StockAnalysis:
     analysis = StockAnalysis(code=code)
 
-    info, info_error = fetch_individual_info(ak, code)
+    spot_row = spot.get(code, {})
+    if spot_row:
+        info, info_error = spot_row, None
+    else:
+        info, info_error = fetch_individual_info(ak, code)
     if info_error:
         analysis.source_errors.append(info_error)
 
@@ -1044,7 +1069,6 @@ def build_analysis(
     analysis.technical = technical
     analysis.technical_trend = technical_trend
 
-    spot_row = spot.get(code, {})
     analysis.name = str(spot_row.get("名称") or info.get("股票简称") or "")
     analysis.industry = str(info.get("行业") or "")
     analysis.listed_at = format_date_like(info.get("上市时间"))

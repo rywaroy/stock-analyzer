@@ -484,7 +484,7 @@ app.get('/api/stocks/:code', async (req, res) => {
       FROM stock_signal_outcome
       WHERE stock_code = ?
         AND status = 'matured'
-        AND (signal_score >= 50 OR signal_score <= -50)
+        AND (signal_score > 70 OR signal_score < -70)
       GROUP BY horizon, window_days
       ORDER BY ${horizonOrderExpression('horizon')}, window_days ASC
     `,
