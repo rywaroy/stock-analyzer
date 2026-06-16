@@ -3,9 +3,17 @@ import { once } from 'node:events';
 import http from 'node:http';
 import test from 'node:test';
 
-import { createApp } from '../server/index.js';
+import { createApp, shouldStartServer } from '../server/index.js';
 
 const DEFAULT_TOKEN = 'stock-analysis-ingest-2026-6f8c2d91b7a443e0';
+
+test('shouldStartServer starts when running under PM2', () => {
+  assert.equal(shouldStartServer(['node', '/pm2/ProcessContainerFork.js'], { pm_id: '13' }), true);
+});
+
+test('shouldStartServer does not start when imported by tests', () => {
+  assert.equal(shouldStartServer(['node', '/tmp/tests/ingest-api.test.js'], {}), false);
+});
 
 function createFakePool() {
   return {

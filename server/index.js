@@ -1289,7 +1289,11 @@ ORDER BY stock_code, horizon, window_days
   return app;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+export function shouldStartServer(argv = process.argv, env = process.env) {
+  return Boolean(env.pm_id || (argv[1] && import.meta.url === pathToFileURL(argv[1]).href));
+}
+
+if (shouldStartServer()) {
   const port = Number(process.env.PORT || process.env.STOCK_DASHBOARD_PORT || 8001);
   const app = createApp();
   app.listen(port, () => {
