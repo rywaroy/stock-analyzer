@@ -1,5 +1,7 @@
 import importlib.util
+import contextlib
 import datetime as dt
+import io
 import json
 import sys
 import tempfile
@@ -203,6 +205,7 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
             technical_days=260,
             adjust="qfq",
             as_of_date=dt.date(2026, 3, 15),
+            quiet=True,
         )
         analysis = StockAnalysis(
             code="002466",
@@ -241,6 +244,7 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
                 technical_days=260,
                 adjust="qfq",
                 as_of_date=None,
+                quiet=True,
             )
             analysis = StockAnalysis(
                 code="002466",
@@ -256,6 +260,94 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
                 items = mysql_sink.fetch_analysis_items(args)
 
         self.assertEqual(items[0]["name"], "天齐锂业")
+
+    def test_fetch_analysis_items_logs_progress_and_source_errors(self):
+        args = SimpleNamespace(
+            codes=["002466", "600519"],
+            codes_file="stock.md",
+            start_year="2021",
+            technical_days=260,
+            adjust="qfq",
+            as_of_date=None,
+            quiet=False,
+        )
+        analyses = [
+            StockAnalysis(
+                code="002466",
+                name="天齐锂业",
+                technical=sfa.TechnicalSnapshot(trade_date="2026-06-16", latest_close=62.5),
+                source_errors=[],
+            ),
+            StockAnalysis(
+                code="600519",
+                name="贵州茅台",
+                technical=sfa.TechnicalSnapshot(trade_date="2026-06-16", latest_close=1400),
+                source_errors=[],
+            ),
+        ]
+        stderr = io.StringIO()
+
+        with (
+            patch.dict(sys.modules, {"akshare": SimpleNamespace()}),
+            patch.object(mysql_sink.sfa, "resolve_input_codes", return_value=["002466", "600519"]),
+            patch.object(
+                mysql_sink.sfa,
+                "fetch_spot_snapshot",
+                return_value=({}, "实时估值快照获取失败：ProxyError"),
+            ),
+            patch.object(mysql_sink.sfa, "build_analysis", side_effect=analyses),
+            contextlib.redirect_stderr(stderr),
+        ):
+            mysql_sink.fetch_analysis_items(args)
+
+        output = stderr.getvalue()
+        self.assertIn("准备分析 2 只股票", output)
+        self.assertIn("[1/2] 开始分析 002466", output)
+        self.assertIn("[2/2] 完成分析 600519", output)
+        self.assertIn("数据源提醒：实时估值快照获取失败：ProxyError", output)
+
+    def test_preflight_checks_runtime_dependencies_codes_and_ingest_health(self):
+        args = SimpleNamespace(
+            codes=[],
+            codes_file="stock.md",
+            ingest_url="https://stock.example.com/api/ingest/daily-analysis",
+            quiet=False,
+        )
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"ok":true,"database":"stock_analysis_test"}'
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        stderr = io.StringIO()
+        with (
+            patch.dict(sys.modules, {"akshare": SimpleNamespace(__version__="1.18.64")}),
+            patch.object(mysql_sink, "load_scorer", return_value=SimpleNamespace()),
+            patch.object(mysql_sink.sfa, "resolve_input_codes", return_value=["002466", "600519"]),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = mysql_sink.run_preflight(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["url"], "https://stock.example.com/api/health")
+        self.assertEqual(captured["timeout"], 10)
+        output = stderr.getvalue()
+        self.assertIn("akshare 可导入", output)
+        self.assertIn("股票代码文件可读取：2 只", output)
+        self.assertIn("生产服务健康检查通过", output)
 
     def test_parse_args_accepts_historical_backfill_options(self):
         args = mysql_sink.parse_args(
@@ -273,6 +365,11 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertEqual(args.as_of_date, dt.date(2026, 3, 15))
         self.assertEqual(args.backfill_from, dt.date(2026, 3, 15))
         self.assertEqual(args.backfill_to, dt.date(2026, 3, 20))
+
+    def test_parse_args_accepts_skip_eastmoney(self):
+        args = mysql_sink.parse_args(["002466", "--skip-eastmoney"])
+
+        self.assertTrue(args.skip_eastmoney)
 
     def test_backfill_helpers_iterate_dates_and_skip_duplicate_trade_dates(self):
         self.assertEqual(
@@ -465,6 +562,100 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertEqual(spot["002466"]["名称"], "天齐锂业")
         self.assertEqual(spot["002466"]["市盈率-动态"], 14.7)
         self.assertEqual(spot["002466"]["换手率"], 4.64)
+
+    def test_fetch_spot_snapshot_falls_back_to_sina_realtime_quote(self):
+        import pandas as pd
+
+        class FakeAk:
+            def stock_zh_a_spot(self):
+                return pd.DataFrame(
+                    [
+                        {
+                            "代码": "sz002466",
+                            "名称": "天齐锂业",
+                            "最新价": 64.04,
+                            "涨跌幅": 0.078,
+                            "成交量": 70765374.0,
+                            "成交额": 4567795653.0,
+                        }
+                    ]
+                )
+
+        with patch.object(sfa, "eastmoney_stock_snapshot", side_effect=RuntimeError("proxy closed")):
+            spot, error = sfa.fetch_spot_snapshot(FakeAk(), ["002466"])
+
+        self.assertEqual(spot["002466"]["名称"], "天齐锂业")
+        self.assertEqual(spot["002466"]["股票简称"], "天齐锂业")
+        self.assertEqual(spot["002466"]["最新价"], 64.04)
+        self.assertEqual(spot["002466"]["涨跌幅"], 0.078)
+        self.assertEqual(spot["002466"]["数据源"], "新浪实时行情")
+        self.assertIn("实时估值快照降级", error)
+        self.assertIn("缺少动态市盈率/市净率/市值/股本/行业/上市时间", error)
+
+    def test_fetch_spot_snapshot_stops_eastmoney_after_proxy_failure(self):
+        import pandas as pd
+
+        class FakeAk:
+            def stock_zh_a_spot(self):
+                return pd.DataFrame(
+                    [
+                        {"代码": "sz002466", "名称": "天齐锂业", "最新价": 64.04},
+                        {"代码": "sh600519", "名称": "贵州茅台", "最新价": 1240.0},
+                    ]
+                )
+
+        with patch.object(sfa, "eastmoney_stock_snapshot", side_effect=RuntimeError("Unable to connect to proxy")) as eastmoney_mock:
+            spot, error = sfa.fetch_spot_snapshot(FakeAk(), ["002466", "600519"])
+
+        eastmoney_mock.assert_called_once_with("002466")
+        self.assertEqual(set(spot), {"002466", "600519"})
+        self.assertEqual(spot["600519"]["名称"], "贵州茅台")
+        self.assertIn("已停止继续尝试Eastmoney", error)
+
+    def test_fetch_spot_snapshot_can_skip_eastmoney_directly(self):
+        import pandas as pd
+
+        class FakeAk:
+            def stock_zh_a_spot(self):
+                return pd.DataFrame([{"代码": "sz002466", "名称": "天齐锂业", "最新价": 64.04}])
+
+        with patch.object(sfa, "eastmoney_stock_snapshot") as eastmoney_mock:
+            spot, error = sfa.fetch_spot_snapshot(FakeAk(), ["002466"], skip_eastmoney=True)
+
+        eastmoney_mock.assert_not_called()
+        self.assertEqual(spot["002466"]["名称"], "天齐锂业")
+        self.assertIn("已跳过Eastmoney", error)
+
+    def test_fetch_individual_info_falls_back_to_code_name_table(self):
+        import pandas as pd
+
+        class FakeAk:
+            def stock_info_a_code_name(self):
+                return pd.DataFrame([{"code": "002466", "name": "天齐锂业"}])
+
+        with patch.object(sfa, "eastmoney_stock_snapshot", side_effect=RuntimeError("proxy closed")):
+            info, error = sfa.fetch_individual_info(FakeAk(), "002466")
+
+        self.assertEqual(info["股票代码"], "002466")
+        self.assertEqual(info["股票简称"], "天齐锂业")
+        self.assertEqual(info["名称"], "天齐锂业")
+        self.assertEqual(info["数据源"], "A股代码名称表")
+        self.assertIn("个股信息降级", error)
+        self.assertIn("缺少行业/股本/上市时间/估值字段", error)
+
+    def test_fetch_individual_info_can_skip_eastmoney_directly(self):
+        import pandas as pd
+
+        class FakeAk:
+            def stock_info_a_code_name(self):
+                return pd.DataFrame([{"code": "002466", "name": "天齐锂业"}])
+
+        with patch.object(sfa, "eastmoney_stock_snapshot") as eastmoney_mock:
+            info, error = sfa.fetch_individual_info(FakeAk(), "002466", skip_eastmoney=True)
+
+        eastmoney_mock.assert_not_called()
+        self.assertEqual(info["股票简称"], "天齐锂业")
+        self.assertIn("已跳过Eastmoney", error)
 
     def test_build_analysis_reuses_spot_snapshot_info_without_second_eastmoney_request(self):
         spot = {
@@ -933,6 +1124,7 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
             patch.object(mysql_sink, "ensure_schema") as ensure_schema_mock,
             patch.object(mysql_sink, "persist_results") as persist_mock,
             patch.object(mysql_sink, "upload_results", return_value={"ok": True}) as upload_mock,
+            contextlib.redirect_stdout(io.StringIO()),
         ):
             exit_code = mysql_sink.main(
                 [
@@ -941,6 +1133,7 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
                     "https://stock.example.com/api/ingest/daily-analysis",
                     "--ingest-token",
                     "secret",
+                    "--quiet",
                 ]
             )
 

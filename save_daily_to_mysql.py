@@ -13,7 +13,9 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,18 @@ import stock_fundamental_analysis as sfa
 PROJECT_ROOT = Path(__file__).resolve().parent
 SCORER_PATH = PROJECT_ROOT / ".codex/skills/stock-buy-signal-analysis/scripts/analyze_stock.py"
 DEFAULT_INGEST_API_TOKEN = "stock-analysis-ingest-2026-6f8c2d91b7a443e0"
+
+
+def describe_exception(exc: Exception) -> str:
+    message = str(exc)
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
+def log_status(args: argparse.Namespace, message: str) -> None:
+    if getattr(args, "quiet", False):
+        return
+    timestamp = dt.datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {message}", file=sys.stderr, flush=True)
 
 
 def number(value: Any) -> float | None:
@@ -252,19 +266,46 @@ def fetch_analysis_items(args: argparse.Namespace) -> list[dict[str, Any]]:
 
     codes = sfa.resolve_input_codes(args.codes, args.codes_file)
     code_names = {} if args.codes else sfa.load_code_names_from_file(args.codes_file)
+    log_status(args, f"准备分析 {len(codes)} 只股票")
     as_of_date = getattr(args, "as_of_date", None)
+    skip_eastmoney = getattr(args, "skip_eastmoney", False)
     if as_of_date:
         spot, spot_error = {}, "历史回填模式不使用实时行情/估值快照"
+        log_status(args, f"历史模式：{as_of_date:%Y-%m-%d} 不使用实时行情/估值快照")
     else:
-        spot, spot_error = sfa.fetch_spot_snapshot(ak, codes)
+        source_label = "新浪实时行情降级源" if skip_eastmoney else "实时估值快照"
+        log_status(args, f"开始获取{source_label}")
+        spot, spot_error = sfa.fetch_spot_snapshot(ak, codes, skip_eastmoney=skip_eastmoney)
+        if spot_error:
+            log_status(args, f"数据源提醒：{spot_error}")
+        else:
+            log_status(args, f"实时估值快照完成：{len(spot)}/{len(codes)}")
     adjust = "" if args.adjust == "none" else args.adjust
     analyses = []
-    for code in codes:
-        analysis = sfa.build_analysis(ak, code, args.start_year, spot, args.technical_days, adjust, as_of_date)
+    total = len(codes)
+    for index, code in enumerate(codes, start=1):
+        log_status(args, f"[{index}/{total}] 开始分析 {code}")
+        if skip_eastmoney:
+            analysis = sfa.build_analysis(
+                ak,
+                code,
+                args.start_year,
+                spot,
+                args.technical_days,
+                adjust,
+                as_of_date,
+                skip_eastmoney=True,
+            )
+        else:
+            analysis = sfa.build_analysis(ak, code, args.start_year, spot, args.technical_days, adjust, as_of_date)
         if not analysis.name:
             analysis.name = code_names.get(code, "")
         if spot_error:
             analysis.source_errors.append(spot_error)
+        trade_date = analysis.technical.trade_date if analysis.technical else "未知交易日"
+        error_count = len(analysis.source_errors)
+        suffix = f"，source_errors={error_count}" if error_count else ""
+        log_status(args, f"[{index}/{total}] 完成分析 {code} {trade_date}{suffix}")
         analyses.append(analysis)
     return sfa.analyses_to_jsonable(analyses)
 
@@ -772,7 +813,17 @@ def filter_new_trade_date_results(
 
 def analyze_results(args: argparse.Namespace, scorer: Any) -> list[dict[str, Any]]:
     items = fetch_analysis_items(args)
-    return [scorer.score_item(item) for item in items]
+    total = len(items)
+    log_status(args, f"开始评分 {total} 只股票")
+    results = []
+    for index, item in enumerate(items, start=1):
+        result = scorer.score_item(item)
+        log_status(
+            args,
+            f"[{index}/{total}] 评分完成 {result['code']} score={result['score']} signal={result['signal']} confidence={result['confidence']}",
+        )
+        results.append(result)
+    return results
 
 
 def persist_results(results: list[dict[str, Any]], args: argparse.Namespace) -> None:
@@ -808,6 +859,61 @@ def upload_results(results: list[dict[str, Any]], args: argparse.Namespace, adju
     return json.loads(body) if body else {}
 
 
+def health_url_for_ingest_url(ingest_url: str) -> str:
+    parsed = urllib.parse.urlsplit(ingest_url)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/api/health", "", ""))
+
+
+def run_preflight(args: argparse.Namespace) -> int:
+    failures: list[str] = []
+    log_status(args, "开始环境预检")
+
+    try:
+        import akshare as ak
+
+        version = getattr(ak, "__version__", "unknown")
+        log_status(args, f"akshare 可导入：{version}")
+    except Exception as exc:
+        failures.append(f"akshare 导入失败：{describe_exception(exc)}")
+
+    try:
+        load_scorer()
+        log_status(args, "评分器可加载")
+    except Exception as exc:
+        failures.append(f"评分器加载失败：{describe_exception(exc)}")
+
+    try:
+        codes = sfa.resolve_input_codes(args.codes, args.codes_file)
+        preview = ", ".join(codes[:5])
+        more = "..." if len(codes) > 5 else ""
+        log_status(args, f"股票代码文件可读取：{len(codes)} 只（{preview}{more}）")
+    except Exception as exc:
+        failures.append(f"股票代码读取失败：{describe_exception(exc)}")
+
+    if args.ingest_url:
+        health_url = health_url_for_ingest_url(args.ingest_url)
+        try:
+            request = urllib.request.Request(health_url, method="GET")
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = response.read().decode("utf-8")
+            payload = json.loads(body) if body else {}
+            if payload.get("ok") is False:
+                failures.append(f"生产服务健康检查失败：{payload}")
+            else:
+                database = payload.get("database")
+                suffix = f"，database={database}" if database else ""
+                log_status(args, f"生产服务健康检查通过：{health_url}{suffix}")
+        except Exception as exc:
+            failures.append(f"生产服务健康检查失败：{describe_exception(exc)}")
+
+    if failures:
+        for failure in failures:
+            log_status(args, failure)
+        return 1
+    log_status(args, "环境预检通过")
+    return 0
+
+
 def render_dry_run_sql(results: list[dict[str, Any]], adjust_type: str) -> str:
     sql = build_persist_sql(results, adjust_type)
     return sql + "\n" + refresh_signal_outcomes_sql() + "\n"
@@ -837,14 +943,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--backfill-to", type=parse_arg_date, help="历史回填结束日期，需与 --backfill-from 同时使用")
     parser.add_argument("--ingest-url", default="", help="通过 Express ingest 接口上报分析结果，传入后不直连本地 MySQL")
     parser.add_argument("--ingest-token", default="", help="Express ingest 接口 Bearer Token；也可用 INGEST_API_TOKEN")
+    parser.add_argument("--skip-eastmoney", action="store_true", help="跳过 Eastmoney 实时概要/估值接口，直接使用降级数据源")
+    parser.add_argument("--preflight", action="store_true", help="只检查运行环境、代码文件和生产服务健康，不抓取或写入股票数据")
+    parser.add_argument("--quiet", action="store_true", help="关闭进度日志，仅保留最终结果或错误")
     parser.add_argument("--dry-run", action="store_true", help="只打印将执行的 SQL，不写库")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    started_at = time.monotonic()
     try:
         validate_database_name(args.database)
+        if args.preflight:
+            return run_preflight(args)
         scorer = load_scorer()
         as_of_dates = requested_as_of_dates(args)
         if args.dry_run and args.ingest_url:
@@ -867,9 +979,15 @@ def main(argv: list[str]) -> int:
             if args.dry_run:
                 dry_run_parts.append(render_dry_run_sql(results, args.adjust))
             elif args.ingest_url:
-                upload_results(results, run_args, args.adjust)
+                log_status(args, f"开始上报生产 ingest：{len(results)} 条结果")
+                upload_response = upload_results(results, run_args, args.adjust)
+                persisted_count = upload_response.get("persistedCount")
+                suffix = f"，persistedCount={persisted_count}" if persisted_count is not None else ""
+                log_status(args, f"生产 ingest 上报完成{suffix}")
             else:
+                log_status(args, f"开始写入本地 MySQL：{len(results)} 条结果")
                 persist_results(results, run_args)
+                log_status(args, "本地 MySQL 写入完成")
             all_results.extend(results)
         if args.dry_run:
             print("\n".join(dry_run_parts), end="")
@@ -885,6 +1003,8 @@ def main(argv: list[str]) -> int:
             f"{result['code']} {trade_date} 已写入："
             f"score={result['score']} signal={result['signal']} confidence={result['confidence']}"
         )
+    elapsed = time.monotonic() - started_at
+    log_status(args, f"任务完成：{len(all_results)} 条结果，耗时 {elapsed:.1f}s")
     return 0
 
 

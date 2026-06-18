@@ -905,18 +905,133 @@ def eastmoney_stock_snapshot(code: str, timeout: float = 10, max_retries: int = 
     }
 
 
-def fetch_spot_snapshot(ak: Any, codes: list[str]) -> tuple[dict[str, dict[str, Any]], str | None]:
+def should_stop_eastmoney_attempts(exc: Exception) -> bool:
+    text = str(exc)
+    return any(
+        marker in text
+        for marker in [
+            "Unable to connect to proxy",
+            "RemoteDisconnected",
+            "Max retries exceeded",
+            "Connection aborted",
+        ]
+    )
+
+
+def sina_spot_row_to_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    code = normalize_code(str(row.get("代码", "")))
+    name = str(row.get("名称") or "")
+    latest = row.get("最新价")
+    return {
+        "代码": code,
+        "名称": name,
+        "最新价": latest,
+        "涨跌幅": row.get("涨跌幅"),
+        "成交量": row.get("成交量"),
+        "成交额": row.get("成交额"),
+        "股票代码": code,
+        "股票简称": name,
+        "最新": latest,
+        "数据源": "新浪实时行情",
+    }
+
+
+def fetch_sina_spot_snapshot(ak: Any, codes: list[str]) -> tuple[dict[str, dict[str, Any]], str | None]:
+    try:
+        spot_df = call_akshare_quietly(ak.stock_zh_a_spot)
+    except Exception as exc:
+        return {}, f"新浪实时行情获取失败：{summarize_exception(exc)}"
+    if spot_df is None or spot_df.empty:
+        return {}, "新浪实时行情为空"
+
+    code_set = set(codes)
     result: dict[str, dict[str, Any]] = {}
-    errors: list[str] = []
-    for code in codes:
+    for _, row in spot_df.iterrows():
+        row_dict = dataframe_row_to_dict(row)
         try:
-            result[code] = eastmoney_stock_snapshot(code)
-        except Exception as exc:
-            errors.append(f"{code}: {summarize_exception(exc)}")
+            code = normalize_code(str(row_dict.get("代码", "")))
+        except ValueError:
+            continue
+        if code in code_set:
+            result[code] = sina_spot_row_to_snapshot(row_dict)
     if result:
         return result, None
+    return {}, "新浪实时行情未覆盖目标股票"
+
+
+def fetch_code_name_info(ak: Any, code: str) -> tuple[dict[str, Any], str | None]:
+    try:
+        code_name_df = call_akshare_quietly(ak.stock_info_a_code_name)
+    except Exception as exc:
+        return {}, f"A股代码名称表获取失败：{summarize_exception(exc)}"
+    if code_name_df is None or code_name_df.empty:
+        return {}, "A股代码名称表为空"
+
+    for _, row in code_name_df.iterrows():
+        row_dict = dataframe_row_to_dict(row)
+        try:
+            row_code = normalize_code(str(row_dict.get("code") or row_dict.get("代码") or ""))
+        except ValueError:
+            continue
+        if row_code == code:
+            name = str(row_dict.get("name") or row_dict.get("名称") or "")
+            return {
+                "代码": code,
+                "名称": name,
+                "股票代码": code,
+                "股票简称": name,
+                "数据源": "A股代码名称表",
+            }, None
+    return {}, f"A股代码名称表未覆盖目标股票：{code}"
+
+
+def fetch_spot_snapshot(
+    ak: Any,
+    codes: list[str],
+    skip_eastmoney: bool = False,
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    result: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    eastmoney_stopped = False
+    if not skip_eastmoney:
+        for code in codes:
+            try:
+                result[code] = eastmoney_stock_snapshot(code)
+            except Exception as exc:
+                errors.append(f"{code}: {summarize_exception(exc)}")
+                if should_stop_eastmoney_attempts(exc):
+                    eastmoney_stopped = True
+                    break
+    missing_codes = [code for code in codes if code not in result]
+    fallback_error = None
+    if missing_codes:
+        fallback_result, fallback_error = fetch_sina_spot_snapshot(ak, missing_codes)
+        result.update(fallback_result)
+    if result:
+        if skip_eastmoney:
+            warning = (
+                "实时估值快照降级：已跳过Eastmoney；"
+                "已使用新浪实时行情补充可用字段；缺少动态市盈率/市净率/市值/股本/行业/上市时间"
+            )
+            if fallback_error and len(result) < len(codes):
+                warning = f"{warning}；{fallback_error}"
+            return result, warning
+        if errors:
+            stop_note = "；已停止继续尝试Eastmoney" if eastmoney_stopped else ""
+            warning = (
+                f"实时估值快照降级：Eastmoney失败（{'; '.join(errors[:3])}）{stop_note}；"
+                "已使用新浪实时行情补充可用字段；缺少动态市盈率/市净率/市值/股本/行业/上市时间"
+            )
+            if fallback_error and len(result) < len(codes):
+                warning = f"{warning}；{fallback_error}"
+            return result, warning
+        return result, None
+    if skip_eastmoney:
+        suffix = f"；{fallback_error}" if fallback_error else ""
+        return {}, f"实时估值快照获取失败：已跳过Eastmoney{suffix}"
     if errors:
-        return {}, f"实时估值快照获取失败：{'; '.join(errors[:3])}"
+        suffix = f"；{fallback_error}" if fallback_error else ""
+        return {}, f"实时估值快照获取失败：{'; '.join(errors[:3])}{suffix}"
     return {}, "实时估值快照为空"
 
 
@@ -937,11 +1052,28 @@ def fetch_akshare_spot_snapshot(ak: Any, codes: list[str]) -> tuple[dict[str, di
     return result, None
 
 
-def fetch_individual_info(ak: Any, code: str) -> tuple[dict[str, Any], str | None]:
+def fetch_individual_info(ak: Any, code: str, skip_eastmoney: bool = False) -> tuple[dict[str, Any], str | None]:
+    if skip_eastmoney:
+        fallback, fallback_error = fetch_code_name_info(ak, code)
+        if fallback:
+            return fallback, (
+                "个股信息降级：已跳过Eastmoney；"
+                "已使用A股代码名称表；缺少行业/股本/上市时间/估值字段"
+            )
+        suffix = f"；{fallback_error}" if fallback_error else ""
+        return {}, f"个股信息获取失败：已跳过Eastmoney{suffix}"
     try:
         snapshot = eastmoney_stock_snapshot(code)
     except Exception as exc:
-        return {}, f"个股信息获取失败：{summarize_exception(exc)}"
+        eastmoney_error = summarize_exception(exc)
+        fallback, fallback_error = fetch_code_name_info(ak, code)
+        if fallback:
+            return fallback, (
+                f"个股信息降级：Eastmoney失败（{eastmoney_error}）；"
+                "已使用A股代码名称表；缺少行业/股本/上市时间/估值字段"
+            )
+        suffix = f"；{fallback_error}" if fallback_error else ""
+        return {}, f"个股信息获取失败：{eastmoney_error}{suffix}"
     return snapshot, None
 
 
@@ -1048,6 +1180,7 @@ def build_analysis(
     technical_days: int,
     adjust: str,
     as_of_date: dt.date | None = None,
+    skip_eastmoney: bool = False,
 ) -> StockAnalysis:
     analysis = StockAnalysis(code=code)
 
@@ -1055,7 +1188,7 @@ def build_analysis(
     if spot_row:
         info, info_error = spot_row, None
     else:
-        info, info_error = fetch_individual_info(ak, code)
+        info, info_error = fetch_individual_info(ak, code, skip_eastmoney)
     if info_error:
         analysis.source_errors.append(info_error)
 

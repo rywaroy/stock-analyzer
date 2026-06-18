@@ -16,7 +16,7 @@ Always separate the time horizon:
 - 长期：质量主导，重点看 ROE、成长、现金流、估值和 120/250 日趋势。
 - 总分：保留为跨周期综合判断，不替代三档评分。
 
-This skill is local to this project. Always work from the project root: `/Users/zhangzhihao/experiment/stock-analysis`.
+This skill is local to this project. Always work from the project root: `/Users/zhangzhihao/Documents/GitHub/stock-analyzer`.
 
 ## Required Workflow
 
@@ -48,6 +48,28 @@ uv run --python 3.12 --with-requirements requirements.txt \
 ```
 
 In historical mode, technical daily data is cut off at the as-of date. Do not use today's realtime spot/valuation snapshot or financial indicator endpoint to fill historical fundamentals; the workflow records those omissions in `source_errors_json` and lowers confidence instead.
+
+For online reporting, post the analysis results to the production ingest endpoint:
+
+```bash
+uv run --python 3.12 --with-requirements requirements.txt \
+  python save_daily_to_mysql.py \
+  --ingest-url "http://stock.zzh.cool/api/ingest/daily-analysis"
+```
+
+When `--ingest-url` is provided, the local workflow still fetches AKShare data and scores the stocks, then uploads structured results to the online Express service. The online service is responsible for MySQL upsert, historical signal accuracy refresh, and final report regeneration.
+
+For Codex automation, schedule this skill every Monday to Friday at 06:00 Asia/Shanghai. The automation should run the full workflow and use the production ingest endpoint above for online reporting.
+
+Automation command:
+
+```bash
+uv run --python 3.12 --with-requirements requirements.txt \
+  python save_daily_to_mysql.py \
+  --ingest-url "http://stock.zzh.cool/api/ingest/daily-analysis"
+```
+
+If Eastmoney `push2` is unavailable in the current network, first run the same command with `--preflight` to verify the environment and production service. For a production run that should bypass Eastmoney immediately and use fallback sources for available quote/name fields, add `--skip-eastmoney`. Keep source errors visible because fallback data does not replace PE/PB, market cap, share capital, industry, or listed date.
 
 2. Read the latest final report from `stock_daily_report`:
 
