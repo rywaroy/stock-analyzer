@@ -197,6 +197,7 @@ def generate_final_report(result: dict[str, Any]) -> tuple[str, str, dict[str, A
     strengths = item.get("strengths") or ["暂无明确优势"]
     risks = item.get("risks") or ["暂无明确风险"]
     accuracy_lines = evaluation_summary_lines(result)
+    strategy_adjustments = result.get("strategy_adjustments") or []
 
     lines = [
         f"# {display_name} 最终分析报告",
@@ -238,6 +239,15 @@ def generate_final_report(result: dict[str, Any]) -> tuple[str, str, dict[str, A
     if accuracy_lines:
         lines.extend(["", "## 历史验证", ""])
         lines.extend(accuracy_lines)
+    if strategy_adjustments:
+        lines.extend(["", "## 复盘与自学习", ""])
+        horizons = horizon_scores(result)
+        for adjustment in strategy_adjustments:
+            horizon_key = str(adjustment.get("horizon") or "unknown")
+            horizon = str((horizons.get(horizon_key) or {}).get("label") or horizon_key)
+            adjustment_id = str(adjustment.get("id") or "unknown")
+            reason = str(adjustment.get("reason") or "暂无原因")
+            lines.append(f"- {horizon}：{adjustment_id}，{reason}")
     lines.extend(["", "## 操作建议", "", result["advice"]])
     if source_errors:
         lines.extend(["", "## 数据提醒", ""])
@@ -250,6 +260,7 @@ def generate_final_report(result: dict[str, Any]) -> tuple[str, str, dict[str, A
         "regime": result["regime"],
         "advice": result["advice"],
         "horizon_scores": horizon_scores(result),
+        "strategy_adjustments": strategy_adjustments,
         "strengths": strengths,
         "risks": risks,
         "source_errors": source_errors,

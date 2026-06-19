@@ -751,6 +751,14 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
                 "medium_term": {"label": "中期", "score": 6, "signal": "观望"},
                 "long_term": {"label": "长期", "score": 18, "signal": "买入偏向"},
             },
+            "strategy_adjustments": [
+                {
+                    "id": "macd-kdj-overheat-short-term",
+                    "horizon": "short_term",
+                    "regime": "trend",
+                    "reason": "历史复盘显示短期择时过度奖励 MACD/KDJ 共振。",
+                }
+            ],
             "parts": [],
             "source_errors": ["实时估值快照获取失败：ProxyError"],
             "raw": {
@@ -783,9 +791,13 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertIn("短期评分：-8/100（观望）", report_text)
         self.assertIn("中期评分：6/100（观望）", report_text)
         self.assertIn("长期评分：18/100（买入偏向）", report_text)
+        self.assertIn("## 复盘与自学习", report_text)
+        self.assertIn("短期：macd-kdj-overheat-short-term", report_text)
+        self.assertIn("macd-kdj-overheat-short-term", report_text)
         self.assertIn("## 数据提醒", report_text)
         self.assertEqual(report_json["signal"], "观望")
         self.assertEqual(report_json["horizon_scores"]["long_term"]["score"], 18)
+        self.assertEqual(report_json["strategy_adjustments"][0]["id"], "macd-kdj-overheat-short-term")
 
     def test_buy_signal_scorer_returns_three_horizon_scores(self):
         scorer = load_signal_scorer()
@@ -834,6 +846,73 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
             self.assertIsInstance(horizon["score"], int)
             self.assertIn(horizon["signal"], ["强买", "买入偏向", "观望", "卖出偏向", "强卖/回避"])
             self.assertTrue(horizon["parts"])
+
+    def test_buy_signal_scorer_applies_active_review_memory_to_horizon_weights(self):
+        scorer = load_signal_scorer()
+        item = {
+            "code": "002466",
+            "name": "",
+            "valuation": {"市盈率-动态": 24},
+            "metrics": [
+                {"label": "ROE", "value": 12},
+                {"label": "营收增长", "value": 12},
+                {"label": "净利润增长", "value": 14},
+                {"label": "资产负债率", "value": 40},
+                {"label": "每股经营现金流", "value": 0.5},
+                {"label": "经营现金流/净利润", "value": 0.8},
+            ],
+            "technical": {
+                "trade_date": "2026-06-12",
+                "volume_ratio_5": 1.4,
+                "macd": {"dif": 0.2, "dea": 0.1, "bar": 0.2},
+                "boll": {"position": "中轨上方"},
+                "kdj": {"j": 70},
+                "rsi": {"rsi6": 58, "rsi24": 54},
+            },
+            "technical_trend": {
+                "rating": "技术趋势偏强",
+                "score": 4,
+                "windows": [
+                    {"days": 20, "return_pct": 6},
+                    {"days": 60, "return_pct": 12},
+                    {"days": 120, "return_pct": 18},
+                    {"days": 250, "return_pct": 24},
+                ],
+            },
+            "source_errors": [],
+        }
+        memory = {
+            "version": 1,
+            "active_adjustments": [
+                {
+                    "id": "macd-kdj-overheat-short-term",
+                    "status": "active",
+                    "scope": {"horizons": ["short_term"], "regimes": ["trend"]},
+                    "component_weight_multipliers": {"timing": 0.5},
+                    "score_bias": -3,
+                    "reason": "历史复盘显示趋势行情里短期择时过度奖励 MACD/KDJ 共振。",
+                    "evidence": {"sample_count": 12, "hit_rate_delta_pct": -18.5},
+                }
+            ],
+        }
+
+        baseline = scorer.score_item(item, strategy_memory={"version": 1, "active_adjustments": []})
+        adjusted = scorer.score_item(item, strategy_memory=memory)
+
+        baseline_short = baseline["horizon_scores"]["short_term"]
+        adjusted_short = adjusted["horizon_scores"]["short_term"]
+        baseline_timing = next(part for part in baseline_short["parts"] if part["module"] == "短期择时")
+        adjusted_timing = next(part for part in adjusted_short["parts"] if part["module"] == "短期择时")
+
+        self.assertAlmostEqual(adjusted_timing["points"], baseline_timing["points"] * 0.5)
+        self.assertLess(adjusted_short["score"], baseline_short["score"])
+        self.assertIn("复盘 macd-kdj-overheat-short-term 权重 x0.5", adjusted_timing["reason"])
+        self.assertTrue(any(part["module"] == "短期复盘校准" and part["points"] == -3 for part in adjusted_short["parts"]))
+        self.assertEqual(adjusted["horizon_scores"]["medium_term"]["score"], baseline["horizon_scores"]["medium_term"]["score"])
+        self.assertEqual(adjusted["strategy_adjustments"][0]["id"], "macd-kdj-overheat-short-term")
+        markdown = scorer.render_markdown([adjusted])
+        self.assertIn("### 复盘与自学习", markdown)
+        self.assertIn("短期：macd-kdj-overheat-short-term", markdown)
 
     def test_build_persist_sql_includes_daily_report_upsert(self):
         result = {

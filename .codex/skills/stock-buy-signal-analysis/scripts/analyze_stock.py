@@ -7,12 +7,19 @@ import argparse
 import json
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[4]
+
+
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+STRATEGY_MEMORY_PATH = SKILL_ROOT / "references" / "review-memory.md"
+MEMORY_JSON_START = "<!-- strategy-memory-json:start -->"
+MEMORY_JSON_END = "<!-- strategy-memory-json:end -->"
 
 
 def clamp(value: float, lower: int = -100, upper: int = 100) -> int:
@@ -34,6 +41,45 @@ def metric_map(item: dict[str, Any]) -> dict[str, float | None]:
 
 def add(parts: list[dict[str, Any]], module: str, points: float, reason: str) -> None:
     parts.append({"module": module, "points": points, "reason": reason})
+
+
+def empty_strategy_memory() -> dict[str, Any]:
+    return {"version": 1, "active_adjustments": []}
+
+
+def extract_strategy_memory_payload(text: str) -> str:
+    start = text.find(MEMORY_JSON_START)
+    end = text.find(MEMORY_JSON_END)
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("复盘 memory 缺少 strategy-memory-json 标记块")
+
+    block = text[start + len(MEMORY_JSON_START) : end]
+    fence_start = block.find("```json")
+    if fence_start == -1:
+        raise ValueError("复盘 memory 标记块内缺少 json 代码块")
+    payload_start = block.find("\n", fence_start)
+    fence_end = block.find("```", payload_start + 1)
+    if payload_start == -1 or fence_end == -1:
+        raise ValueError("复盘 memory JSON 代码块未正确闭合")
+    return block[payload_start:fence_end].strip()
+
+
+def validate_strategy_memory(memory: Any) -> dict[str, Any]:
+    if not isinstance(memory, dict):
+        raise ValueError("复盘 memory 必须是 JSON object")
+    adjustments = memory.get("active_adjustments", [])
+    if not isinstance(adjustments, list):
+        raise ValueError("复盘 memory 的 active_adjustments 必须是数组")
+    return memory
+
+
+@lru_cache(maxsize=1)
+def load_strategy_memory(memory_path: str | None = None) -> dict[str, Any]:
+    path = Path(memory_path) if memory_path else STRATEGY_MEMORY_PATH
+    if not path.exists():
+        return empty_strategy_memory()
+    payload = extract_strategy_memory_payload(path.read_text(encoding="utf-8"))
+    return validate_strategy_memory(json.loads(payload))
 
 
 HORIZON_DEFINITIONS = {
@@ -312,11 +358,32 @@ def score_horizons(
     timing_score: float,
     data_penalty: float,
     regime: str,
-) -> dict[str, dict[str, Any]]:
+    strategy_memory: dict[str, Any] | None = None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     horizons: dict[str, dict[str, Any]] = {}
+    applied_strategy_adjustments: list[dict[str, Any]] = []
     for key, definition in HORIZON_DEFINITIONS.items():
-        weights = definition["weights"]
-        reasons = definition["reasons"]
+        weights = dict(definition["weights"])
+        reasons = dict(definition["reasons"])
+        horizon_adjustments = matching_strategy_adjustments(strategy_memory, key, regime)
+        for adjustment in horizon_adjustments:
+            adjustment_id = str(adjustment["id"])
+            for component, multiplier in (adjustment.get("component_weight_multipliers") or {}).items():
+                if component not in weights:
+                    raise ValueError(f"复盘 memory 包含未知权重组件：{component}")
+                factor = number(multiplier)
+                if factor is None or factor <= 0:
+                    raise ValueError(f"复盘 memory 权重倍数无效：{adjustment_id}.{component}")
+                weights[component] *= factor
+                reasons[component] = f"{reasons[component]}；复盘 {adjustment_id} 权重 x{factor:g}"
+            applied_strategy_adjustments.append(
+                {
+                    "id": adjustment_id,
+                    "horizon": key,
+                    "regime": regime,
+                    "reason": adjustment.get("reason", ""),
+                }
+            )
         parts = [
             {
                 "module": f"{definition['label']}基本面",
@@ -342,6 +409,16 @@ def score_horizons(
                     "reason": "技术面数据缺失时降低该时间维度置信度和评分",
                 }
             )
+        for adjustment in horizon_adjustments:
+            bias = number(adjustment.get("score_bias"))
+            if bias:
+                parts.append(
+                    {
+                        "module": f"{definition['label']}复盘校准",
+                        "points": bias,
+                        "reason": f"复盘 {adjustment['id']}: {adjustment.get('reason', '')}",
+                    }
+                )
         score = clamp(sum(part["points"] for part in parts))
         horizons[key] = {
             "label": definition["label"],
@@ -350,17 +427,46 @@ def score_horizons(
             "advice": horizon_advice(key, score, regime),
             "parts": parts,
         }
-    return horizons
+    return horizons, applied_strategy_adjustments
 
 
-def score_item(item: dict[str, Any]) -> dict[str, Any]:
+def matching_strategy_adjustments(
+    strategy_memory: dict[str, Any] | None,
+    horizon: str,
+    regime: str,
+) -> list[dict[str, Any]]:
+    if not strategy_memory:
+        return []
+    adjustments: list[dict[str, Any]] = []
+    for adjustment in strategy_memory.get("active_adjustments", []):
+        if adjustment.get("status", "active") != "active":
+            continue
+        if "id" not in adjustment:
+            raise ValueError("复盘 memory 的 active adjustment 缺少 id")
+        scope = adjustment.get("scope") or {}
+        horizons = scope.get("horizons") or list(HORIZON_DEFINITIONS)
+        regimes = scope.get("regimes") or ["trend", "range", "downtrend", "mixed"]
+        if horizon in horizons and regime in regimes:
+            adjustments.append(adjustment)
+    return adjustments
+
+
+def score_item(item: dict[str, Any], strategy_memory: dict[str, Any] | None = None) -> dict[str, Any]:
     regime = detect_regime(item)
     fundamental_score, fundamental_parts = score_fundamentals(item)
     trend_score, trend_parts = score_trend(item)
     timing_score, timing_parts = score_timing(item, regime)
     data_penalty = -5 if not item.get("technical") else 0
     total = clamp(fundamental_score + trend_score + timing_score + data_penalty)
-    horizon_scores = score_horizons(fundamental_score, trend_score, timing_score, data_penalty, regime)
+    memory = validate_strategy_memory(strategy_memory) if strategy_memory is not None else load_strategy_memory()
+    horizon_scores, strategy_adjustments = score_horizons(
+        fundamental_score,
+        trend_score,
+        timing_score,
+        data_penalty,
+        regime,
+        memory,
+    )
     parts = fundamental_parts + trend_parts + timing_parts
     if data_penalty:
         add(parts, "数据质量", data_penalty, "技术面数据缺失，降低评分")
@@ -373,6 +479,7 @@ def score_item(item: dict[str, Any]) -> dict[str, Any]:
         "regime": regime,
         "advice": operation_advice(total, regime),
         "horizon_scores": horizon_scores,
+        "strategy_adjustments": strategy_adjustments,
         "parts": parts,
         "source_errors": item.get("source_errors") or [],
         "raw": item,
@@ -441,6 +548,16 @@ def render_markdown(results: list[dict[str, Any]]) -> str:
         )
         for part in result["parts"]:
             lines.append(f"| {part['module']} | {part['points']:.1f} | {part['reason']} |")
+        strategy_adjustments = result.get("strategy_adjustments") or []
+        if strategy_adjustments:
+            lines.extend(["", "### 复盘与自学习", ""])
+            horizons = result.get("horizon_scores") or {}
+            for adjustment in strategy_adjustments:
+                horizon_key = str(adjustment.get("horizon") or "unknown")
+                horizon = str((horizons.get(horizon_key) or {}).get("label") or horizon_key)
+                adjustment_id = str(adjustment.get("id") or "unknown")
+                reason = str(adjustment.get("reason") or "暂无原因")
+                lines.append(f"- {horizon}：{adjustment_id}，{reason}")
         if result["source_errors"]:
             lines.extend(["", "### 数据提醒", ""])
             lines.extend(f"- {error}" for error in result["source_errors"])

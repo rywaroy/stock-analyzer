@@ -1,4 +1,4 @@
 interface:
   display_name: "Stock Buy Signal Analysis"
-  short_description: "生成A股买卖评分、历史验证和AI推荐ETF组合"
-  default_prompt: "Use $stock-buy-signal-analysis to run the full A-share analysis pipeline for 002466: analyze, persist to MySQL, refresh historical validation, update the AI recommended ETF, and summarize the final report."
+  short_description: "生成A股买卖评分、历史验证、复盘记忆和AI推荐ETF组合"
+  default_prompt: "Use $stock-buy-signal-analysis to run the full A-share analysis pipeline for 002466: analyze, persist to MySQL, refresh historical validation, apply/update review memory, update the AI recommended ETF, and summarize the final report."

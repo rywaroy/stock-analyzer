@@ -41,6 +41,27 @@ For buy-bias signals, positive future return is a directional hit. For sell/avoi
 
 Never recompute old scores with current data when judging accuracy. Use the score snapshot saved on the signal date and compare it with later quote data.
 
+## Review Memory
+
+Use `references/review-memory.md` to turn historical validation into controlled strategy learning.
+
+The scorer reads the machine-readable JSON block in that file:
+
+- Only `active_adjustments` are applied automatically.
+- `scope.horizons` limits the rule to `short_term`, `medium_term`, or `long_term`.
+- `scope.regimes` limits the rule to `trend`, `range`, `downtrend`, or `mixed`.
+- `component_weight_multipliers` changes horizon component weights such as `timing`, `trend`, `fundamental`, or `data_penalty`.
+- `score_bias` adds a small horizon-specific calibration part.
+
+Keep observations and candidate rules outside the active JSON block until enough matured samples support them. This prevents one mistaken stock call from overfitting the scoring model.
+
+Example adjustment types:
+
+- MACD/KDJ over-reward in short-term trend regimes: reduce `timing` weight or add a small negative short-term bias.
+- BOLL lower-band repair in range regimes: test a small `timing` weight increase only if drawdown improves.
+- Oversold bounce in downtrends: keep KDJ/RSI positive points small unless MACD and 20-day trend also improve.
+- Strong medium/long structure with weak short-term timing: reduce short-term pullback penalty only if later returns validate the thesis.
+
 ## Components
 
 ### Fundamentals

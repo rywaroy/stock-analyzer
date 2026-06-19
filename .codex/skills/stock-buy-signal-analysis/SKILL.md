@@ -1,13 +1,13 @@
 ---
 name: stock-buy-signal-analysis
-description: Use when analyzing A-share stocks in this project to decide buy/sell/watch signals, persist the analysis to MySQL, refresh historical signal accuracy, produce horizon scores, or build and track an AI-recommended 10-stock ETF portfolio.
+description: Use when analyzing A-share stocks in this project to decide buy/sell/watch signals, persist the analysis to MySQL, refresh historical signal accuracy, review inaccurate signals with strategy memory, produce horizon scores, or build and track an AI-recommended 10-stock ETF portfolio.
 ---
 
 # Stock Buy Signal Analysis
 
 ## Overview
 
-Act as a senior stock analyst, but keep the decision data-driven. The default workflow is persistent: fetch stock fundamentals and technical trend data, write the daily snapshot to MySQL, refresh historical signal accuracy, build/update the AI recommended ETF portfolio, then read the final report. Scores use `-100..100` where positive means buy bias, negative means sell bias, and near zero means watch.
+Act as a senior stock analyst, but keep the decision data-driven. The default workflow is persistent: fetch stock fundamentals and technical trend data, write the daily snapshot to MySQL, refresh historical signal accuracy, apply review-memory adjustments, build/update the AI recommended ETF portfolio, then read the final report. Scores use `-100..100` where positive means buy bias, negative means sell bias, and near zero means watch.
 
 Always separate the time horizon:
 
@@ -100,9 +100,10 @@ mysql -uroot -D stock_analysis_test \
 ```
 
 4. Confirm `stock_signal_outcome` has the expected pending or matured rows for the analyzed stock/date when discussing historical validation.
-5. Read `source_errors` from the report or `stock_daily_signal_score.source_errors_json`. If a data source failed, say which data is missing and reduce confidence instead of inventing values.
-6. Explain the short-term, medium-term, long-term, and overall scores using fundamentals, trend, timing, historical validation, and risk controls.
-7. Make a clear call for each score:
+5. Read `references/review-memory.md` before explaining accuracy or strategy changes. The scorer automatically applies the JSON `active_adjustments` block to horizon scores; mention any `strategy_adjustments` returned in the scoring JSON. If an analysis proved inaccurate, append a new review log entry. Promote a candidate adjustment into the JSON block only when repeated matured evidence supports it.
+6. Read `source_errors` from the report or `stock_daily_signal_score.source_errors_json`. If a data source failed, say which data is missing and reduce confidence instead of inventing values.
+7. Explain the short-term, medium-term, long-term, and overall scores using fundamentals, trend, timing, historical validation, review memory, and risk controls.
+8. Make a clear call for each score:
    - `>= 50`: strong buy bias
    - `15..49`: buy bias, prefer staged entry
    - `-14..14`: watch
@@ -112,6 +113,16 @@ mysql -uroot -D stock_analysis_test \
 ## Analyst Logic
 
 Use the scoring model in `references/scoring-model.md` when you need details. The built-in scorer applies the same model.
+
+Use `references/review-memory.md` when reviewing inaccurate calls or adjusting strategy. Treat it as a disciplined learning loop:
+
+- First classify the miss by horizon, market regime, indicator family, and data quality.
+- Record one review entry per inaccurate or surprisingly accurate signal.
+- Keep one-stock lessons as observations; do not change active weights from a single case.
+- Convert observations to candidate rules only after repeated comparable evidence.
+- Convert candidates to active JSON adjustments only with matured `stock_signal_outcome` evidence.
+- Prefer small horizon-scoped changes: MACD/KDJ timing weight, BOLL/RSI range weight, downtrend oversold penalty, or a small score bias.
+- Keep total score as a raw cross-check; review memory adjusts horizon scores used for decision explanation and ETF ranking.
 
 Core principles:
 
@@ -148,6 +159,7 @@ Answer in Chinese with this structure:
 4. 长期质量与趋势
 5. 风险点
 6. 历史验证：高强度样本数、命中率、平均收益、窗口内回撤/上冲。只使用 `signal_score > 70` 或 `signal_score < -70` 的样本统计准确率。
+7. 复盘与自学习：说明本次应用的 `strategy_adjustments`、是否新增/更新 `references/review-memory.md`、下一步需要验证的候选规则。
 
 🛠️ 操作建议：
 分别说明短期是否适合试仓/等待，中期是否适合分批，长期是否适合纳入配置观察池。
@@ -166,6 +178,7 @@ Avoid guarantees, price targets without data, and investment-advice language. Sa
 ## Tools
 
 - Use `save_daily_to_mysql.py` as the default entrypoint. It performs analysis, schema/migration sync, MySQL upsert, historical accuracy refresh, and final report regeneration.
+- The scorer reads `references/review-memory.md` automatically. Active memory adjustments affect horizon scores and are surfaced as `strategy_adjustments` in JSON output.
 - Use `scripts/analyze_stock.py` only when the user explicitly asks for no database writes, MySQL is unavailable, or you are debugging raw scoring output.
 - Use `stock_fundamental_analysis.py --json` directly only when debugging raw data.
 - Use `--json` on the scorer when another script or table needs structured output.
