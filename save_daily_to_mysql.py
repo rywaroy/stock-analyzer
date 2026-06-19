@@ -132,6 +132,16 @@ HORIZON_KEYS = [
     ("medium_term", "中期"),
     ("long_term", "长期"),
 ]
+AI_ETF_PORTFOLIO_NAME = "AI_RECOMMENDED_ETF"
+AI_ETF_INITIAL_NOTIONAL = 1_000_000.0
+AI_ETF_TARGET_COUNT = 10
+
+
+def value_from_mapping(row: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in row:
+            return row.get(key)
+    return None
 
 
 def horizon_scores(result: dict[str, Any]) -> dict[str, Any]:
@@ -249,6 +259,267 @@ def generate_final_report(result: dict[str, Any]) -> tuple[str, str, dict[str, A
     return title, report_text, report_json
 
 
+def result_trade_date(result: dict[str, Any]) -> str:
+    return str(((result.get("raw") or {}).get("technical") or {}).get("trade_date") or "")
+
+
+def result_close_price(result: dict[str, Any]) -> float | None:
+    return number(((result.get("raw") or {}).get("technical") or {}).get("latest_close"))
+
+
+def ai_etf_horizon_score(result: dict[str, Any], key: str) -> float:
+    score = number(horizon_value(result, key, "score"))
+    return score if score is not None else 0.0
+
+
+def ai_etf_rank_score(result: dict[str, Any]) -> float:
+    score = number(result.get("score")) or 0.0
+    confidence = result.get("confidence")
+    source_errors = result.get("source_errors") or []
+    penalty = 0.0
+    if confidence == "低":
+        penalty += 15.0
+    if source_errors:
+        penalty += min(20.0, len(source_errors) * 5.0)
+    return (
+        ai_etf_horizon_score(result, "short_term") * 0.20
+        + ai_etf_horizon_score(result, "medium_term") * 0.35
+        + ai_etf_horizon_score(result, "long_term") * 0.35
+        + score * 0.10
+        - penalty
+    )
+
+
+def previous_holding_by_code(previous_holdings: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    grouped = {}
+    for row in previous_holdings or []:
+        code = str(value_from_mapping(row, "stock_code", "stockCode") or "")
+        if code:
+            grouped[code] = row
+    return grouped
+
+
+def normalized_action(previous_weight: float, target_weight: float) -> str:
+    delta = round(target_weight - previous_weight, 6)
+    if previous_weight <= 0 and target_weight > 0:
+        return "buy"
+    if previous_weight > 0 and target_weight <= 0:
+        return "sell"
+    if delta > 0.01:
+        return "increase"
+    if delta < -0.01:
+        return "reduce"
+    return "hold"
+
+
+def action_reason(action: str, result: dict[str, Any] | None = None) -> str:
+    if action == "buy":
+        return "新纳入组合，三周期综合评分进入前十。"
+    if action == "sell":
+        return "不再进入本期前十，按调仓参考价模拟卖出。"
+    if action == "increase":
+        return "继续保留且目标权重提高。"
+    if action == "reduce":
+        return "继续保留但目标权重下调。"
+    if result:
+        return "继续保留，评分和风险状态仍满足组合要求。"
+    return "本期无仓位变化。"
+
+
+def holding_rationale(result: dict[str, Any], action: str) -> str:
+    name = result.get("name") or ((result.get("raw") or {}).get("name")) or result.get("code")
+    return (
+        f"{action_reason(action, result)} {name} 综合分 {result.get('score')}，"
+        f"短期 {horizon_value(result, 'short_term', 'score')}，"
+        f"中期 {horizon_value(result, 'medium_term', 'score')}，"
+        f"长期 {horizon_value(result, 'long_term', 'score')}。"
+    )
+
+
+def round_weight(value: float) -> float:
+    return round(value, 4)
+
+
+def build_ai_etf_portfolio(
+    results: list[dict[str, Any]],
+    adjust_type: str,
+    previous_holdings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    candidates = [
+        result
+        for result in results
+        if result_trade_date(result)
+        and result_close_price(result) is not None
+        and str(result.get("code") or "")
+    ]
+    if len(candidates) < AI_ETF_TARGET_COUNT:
+        return None
+
+    ranked = sorted(candidates, key=lambda item: (ai_etf_rank_score(item), number(item.get("score")) or 0), reverse=True)
+    selected = ranked[:AI_ETF_TARGET_COUNT]
+    trade_date = result_trade_date(selected[0])
+    previous_by_code = previous_holding_by_code(previous_holdings)
+    target_weight = round_weight(100.0 / AI_ETF_TARGET_COUNT)
+    holdings = []
+    rebalance = []
+    total_unrealized = 0.0
+    total_realized = 0.0
+    turnover = 0.0
+
+    for result in selected:
+        code = str(result.get("code"))
+        item = result.get("raw") or {}
+        previous = previous_by_code.get(code, {})
+        previous_weight = number(value_from_mapping(previous, "target_weight_pct", "targetWeightPct")) or 0.0
+        reference_price = result_close_price(result)
+        simulated_notional = AI_ETF_INITIAL_NOTIONAL * target_weight / 100.0
+        simulated_quantity = simulated_notional / reference_price if reference_price else None
+        previous_price = number(value_from_mapping(previous, "reference_price", "referencePrice"))
+        previous_quantity = number(value_from_mapping(previous, "simulated_quantity", "simulatedQuantity")) or 0.0
+        unrealized = (
+            (reference_price - previous_price) * previous_quantity
+            if reference_price is not None and previous_price is not None and previous_quantity
+            else 0.0
+        )
+        total_unrealized += unrealized
+        delta = round_weight(target_weight - previous_weight)
+        action = normalized_action(previous_weight, target_weight)
+        turnover += abs(delta)
+        holding = {
+            "portfolioName": AI_ETF_PORTFOLIO_NAME,
+            "tradeDate": trade_date,
+            "adjustType": adjust_type,
+            "stockCode": code,
+            "stockName": result.get("name") or item.get("name") or "",
+            "industry": item.get("industry") or "",
+            "previousWeightPct": round_weight(previous_weight),
+            "targetWeightPct": target_weight,
+            "weightDeltaPct": delta,
+            "action": action,
+            "referencePrice": reference_price,
+            "simulatedQuantity": simulated_quantity,
+            "simulatedNotional": simulated_notional,
+            "score": int_number(result.get("score")),
+            "signalLabel": result.get("signal"),
+            "shortTermScore": int_number(horizon_value(result, "short_term", "score")),
+            "shortTermSignalLabel": horizon_value(result, "short_term", "signal"),
+            "mediumTermScore": int_number(horizon_value(result, "medium_term", "score")),
+            "mediumTermSignalLabel": horizon_value(result, "medium_term", "signal"),
+            "longTermScore": int_number(horizon_value(result, "long_term", "score")),
+            "longTermSignalLabel": horizon_value(result, "long_term", "signal"),
+            "confidence": result.get("confidence"),
+            "rationale": holding_rationale(result, action),
+            "risks": item.get("risks") or [],
+            "rankScore": round(ai_etf_rank_score(result), 4),
+        }
+        holdings.append(holding)
+        rebalance.append(
+            {
+                **{key: holding[key] for key in ["portfolioName", "tradeDate", "adjustType", "stockCode", "stockName", "action"]},
+                "previousWeightPct": holding["previousWeightPct"],
+                "targetWeightPct": holding["targetWeightPct"],
+                "weightDeltaPct": holding["weightDeltaPct"],
+                "referencePrice": reference_price,
+                "simulatedQuantityDelta": simulated_quantity if action in {"buy", "increase"} else 0,
+                "simulatedNotionalDelta": simulated_notional * (delta / target_weight) if target_weight else 0,
+                "realizedPnl": 0.0,
+                "realizedReturnPct": 0.0,
+                "reason": action_reason(action, result),
+            }
+        )
+
+    selected_codes = {holding["stockCode"] for holding in holdings}
+    for code, previous in previous_by_code.items():
+        if code in selected_codes:
+            continue
+        previous_weight = number(value_from_mapping(previous, "target_weight_pct", "targetWeightPct")) or 0.0
+        if previous_weight <= 0:
+            continue
+        previous_price = number(value_from_mapping(previous, "reference_price", "referencePrice"))
+        previous_quantity = number(value_from_mapping(previous, "simulated_quantity", "simulatedQuantity")) or 0.0
+        reference_price = previous_price
+        realized_pnl = 0.0
+        total_realized += realized_pnl
+        turnover += previous_weight
+        stock_name = str(value_from_mapping(previous, "stock_name", "stockName") or "")
+        sell_entry = {
+            "portfolioName": AI_ETF_PORTFOLIO_NAME,
+            "tradeDate": trade_date,
+            "adjustType": adjust_type,
+            "stockCode": code,
+            "stockName": stock_name,
+            "industry": value_from_mapping(previous, "industry") or "",
+            "previousWeightPct": round_weight(previous_weight),
+            "targetWeightPct": 0.0,
+            "weightDeltaPct": round_weight(-previous_weight),
+            "action": "sell",
+            "referencePrice": reference_price,
+            "simulatedQuantity": 0.0,
+            "simulatedNotional": 0.0,
+            "score": None,
+            "signalLabel": None,
+            "shortTermScore": None,
+            "shortTermSignalLabel": None,
+            "mediumTermScore": None,
+            "mediumTermSignalLabel": None,
+            "longTermScore": None,
+            "longTermSignalLabel": None,
+            "confidence": None,
+            "rationale": action_reason("sell"),
+            "risks": [],
+            "rankScore": None,
+        }
+        rebalance.append(
+            {
+                "portfolioName": AI_ETF_PORTFOLIO_NAME,
+                "tradeDate": trade_date,
+                "adjustType": adjust_type,
+                "stockCode": code,
+                "stockName": stock_name,
+                "action": "sell",
+                "previousWeightPct": round_weight(previous_weight),
+                "targetWeightPct": 0.0,
+                "weightDeltaPct": round_weight(-previous_weight),
+                "referencePrice": reference_price,
+                "simulatedQuantityDelta": -previous_quantity,
+                "simulatedNotionalDelta": -(AI_ETF_INITIAL_NOTIONAL * previous_weight / 100.0),
+                "realizedPnl": realized_pnl,
+                "realizedReturnPct": 0.0,
+                "reason": action_reason("sell"),
+            }
+        )
+        holdings.append(sell_entry)
+
+    total_pnl = total_realized + total_unrealized
+    has_previous = bool(previous_by_code)
+    selection_rule = (
+        "基于上一期组合和短期20%/中期35%/长期35%/总分10%的排序调仓。"
+        if has_previous
+        else "首次生成，按三周期综合评分选出10只股票，每只等权10%。"
+    )
+    return {
+        "portfolioName": AI_ETF_PORTFOLIO_NAME,
+        "tradeDate": trade_date,
+        "adjustType": adjust_type,
+        "selectionRule": selection_rule,
+        "nav": AI_ETF_INITIAL_NOTIONAL + total_pnl,
+        "dailyReturnPct": 0.0,
+        "cumulativeReturnPct": (total_pnl / AI_ETF_INITIAL_NOTIONAL) * 100.0,
+        "realizedPnl": total_realized,
+        "unrealizedPnl": total_unrealized,
+        "totalPnl": total_pnl,
+        "turnoverPct": min(200.0, round_weight(turnover)),
+        "holdingCount": len([holding for holding in holdings if holding["targetWeightPct"] > 0]),
+        "holdings": holdings,
+        "rebalance": rebalance,
+        "summary": {
+            "candidateCount": len(candidates),
+            "selectedCount": AI_ETF_TARGET_COUNT,
+            "hasPreviousPortfolio": has_previous,
+        },
+    }
+
+
 def load_scorer() -> Any:
     spec = importlib.util.spec_from_file_location("stock_buy_signal_scorer", SCORER_PATH)
     if spec is None or spec.loader is None:
@@ -264,8 +535,10 @@ def fetch_analysis_items(args: argparse.Namespace) -> list[dict[str, Any]]:
     except ImportError as exc:
         raise RuntimeError("缺少依赖：请用 README 中的 uv 命令运行") from exc
 
-    codes = sfa.resolve_input_codes(args.codes, args.codes_file)
-    code_names = {} if args.codes else sfa.load_code_names_from_file(args.codes_file)
+    codes = getattr(args, "resolved_codes", None) or sfa.resolve_input_codes(args.codes, args.codes_file)
+    code_names = getattr(args, "code_names", None)
+    if code_names is None:
+        code_names = {} if args.codes else sfa.load_code_names_from_file(args.codes_file)
     log_status(args, f"准备分析 {len(codes)} 只股票")
     as_of_date = getattr(args, "as_of_date", None)
     skip_eastmoney = getattr(args, "skip_eastmoney", False)
@@ -629,6 +902,110 @@ def report_statement(result: dict[str, Any], adjust_type: str) -> str:
     )
 
 
+def ai_etf_snapshot_statement(portfolio: dict[str, Any]) -> str:
+    values = {
+        "portfolio_name": sql_text(portfolio["portfolioName"]),
+        "trade_date": sql_date(portfolio["tradeDate"]),
+        "adjust_type": sql_text(portfolio["adjustType"]),
+        "selection_rule": sql_text(portfolio.get("selectionRule")),
+        "nav": sql_number(portfolio.get("nav")),
+        "daily_return_pct": sql_number(portfolio.get("dailyReturnPct")),
+        "cumulative_return_pct": sql_number(portfolio.get("cumulativeReturnPct")),
+        "realized_pnl": sql_number(portfolio.get("realizedPnl")),
+        "unrealized_pnl": sql_number(portfolio.get("unrealizedPnl")),
+        "total_pnl": sql_number(portfolio.get("totalPnl")),
+        "turnover_pct": sql_number(portfolio.get("turnoverPct")),
+        "holding_count": sql_int(portfolio.get("holdingCount")),
+        "summary_json": sql_json(portfolio.get("summary") or {}),
+    }
+    return upsert_sql(
+        "stock_ai_etf_snapshot",
+        values,
+        [
+            "selection_rule",
+            "nav",
+            "daily_return_pct",
+            "cumulative_return_pct",
+            "realized_pnl",
+            "unrealized_pnl",
+            "total_pnl",
+            "turnover_pct",
+            "holding_count",
+            "summary_json",
+        ],
+    )
+
+
+def ai_etf_holding_statement(holding: dict[str, Any]) -> str:
+    values = {
+        "portfolio_name": sql_text(holding["portfolioName"]),
+        "trade_date": sql_date(holding["tradeDate"]),
+        "adjust_type": sql_text(holding["adjustType"]),
+        "stock_code": sql_text(holding["stockCode"]),
+        "stock_name": sql_text(holding.get("stockName") or None),
+        "industry": sql_text(holding.get("industry") or None),
+        "previous_weight_pct": sql_number(holding.get("previousWeightPct")),
+        "target_weight_pct": sql_number(holding.get("targetWeightPct")),
+        "weight_delta_pct": sql_number(holding.get("weightDeltaPct")),
+        "action": sql_text(holding.get("action")),
+        "reference_price": sql_number(holding.get("referencePrice")),
+        "simulated_quantity": sql_number(holding.get("simulatedQuantity")),
+        "simulated_notional": sql_number(holding.get("simulatedNotional")),
+        "score": sql_int(holding.get("score")),
+        "signal_label": sql_text(holding.get("signalLabel")),
+        "short_term_score": sql_int(holding.get("shortTermScore")),
+        "short_term_signal_label": sql_text(holding.get("shortTermSignalLabel")),
+        "medium_term_score": sql_int(holding.get("mediumTermScore")),
+        "medium_term_signal_label": sql_text(holding.get("mediumTermSignalLabel")),
+        "long_term_score": sql_int(holding.get("longTermScore")),
+        "long_term_signal_label": sql_text(holding.get("longTermSignalLabel")),
+        "confidence": sql_text(holding.get("confidence")),
+        "rationale": sql_text(holding.get("rationale")),
+        "risks_json": sql_json(holding.get("risks") or []),
+        "raw_json": sql_json(holding),
+    }
+    return upsert_sql(
+        "stock_ai_etf_holding",
+        values,
+        [column for column in values if column not in {"portfolio_name", "trade_date", "adjust_type", "stock_code"}],
+    )
+
+
+def ai_etf_trade_statement(trade: dict[str, Any]) -> str:
+    values = {
+        "portfolio_name": sql_text(trade["portfolioName"]),
+        "trade_date": sql_date(trade["tradeDate"]),
+        "adjust_type": sql_text(trade["adjustType"]),
+        "stock_code": sql_text(trade["stockCode"]),
+        "stock_name": sql_text(trade.get("stockName") or None),
+        "action": sql_text(trade.get("action")),
+        "previous_weight_pct": sql_number(trade.get("previousWeightPct")),
+        "target_weight_pct": sql_number(trade.get("targetWeightPct")),
+        "weight_delta_pct": sql_number(trade.get("weightDeltaPct")),
+        "reference_price": sql_number(trade.get("referencePrice")),
+        "simulated_quantity_delta": sql_number(trade.get("simulatedQuantityDelta")),
+        "simulated_notional_delta": sql_number(trade.get("simulatedNotionalDelta")),
+        "realized_pnl": sql_number(trade.get("realizedPnl")),
+        "realized_return_pct": sql_number(trade.get("realizedReturnPct")),
+        "reason": sql_text(trade.get("reason")),
+        "raw_json": sql_json(trade),
+    }
+    return upsert_sql(
+        "stock_ai_etf_trade",
+        values,
+        [column for column in values if column not in {"portfolio_name", "trade_date", "adjust_type", "stock_code", "action"}],
+    )
+
+
+def ai_etf_statements(portfolio: dict[str, Any] | None) -> list[str]:
+    if not portfolio:
+        return []
+    statements = [ai_etf_snapshot_statement(portfolio)]
+    statements.extend(ai_etf_holding_statement(holding) for holding in portfolio.get("holdings") or [])
+    statements.extend(ai_etf_trade_statement(trade) for trade in portfolio.get("rebalance") or [])
+    return statements
+
+
 def build_report_sql(results: list[dict[str, Any]], adjust_type: str) -> str:
     statements = ["SET NAMES utf8mb4;", "START TRANSACTION;"]
     statements.extend(report_statement(result, adjust_type) for result in results)
@@ -636,7 +1013,12 @@ def build_report_sql(results: list[dict[str, Any]], adjust_type: str) -> str:
     return "\n\n".join(statements) + "\n"
 
 
-def build_persist_sql(results: list[dict[str, Any]], adjust_type: str, include_reports: bool = True) -> str:
+def build_persist_sql(
+    results: list[dict[str, Any]],
+    adjust_type: str,
+    include_reports: bool = True,
+    previous_ai_etf_holdings: list[dict[str, Any]] | None = None,
+) -> str:
     statements = ["SET NAMES utf8mb4;", "START TRANSACTION;"]
     persisted_codes = []
     for result in results:
@@ -657,6 +1039,9 @@ def build_persist_sql(results: list[dict[str, Any]], adjust_type: str, include_r
         statements.extend(signal_outcome_statements(result, adjust_type))
         if include_reports:
             statements.append(report_statement(result, adjust_type))
+
+    portfolio = build_ai_etf_portfolio(results, adjust_type, previous_ai_etf_holdings)
+    statements.extend(ai_etf_statements(portfolio))
 
     message = f"已写入 {len(persisted_codes)} 只股票的每日分析数据"
     statements.append(
@@ -727,6 +1112,57 @@ def query_mysql(sql: str, args: argparse.Namespace, use_database: bool) -> str:
     return result.stdout
 
 
+def parse_mysql_nullable(value: str) -> str | None:
+    return None if value in {"", "NULL", "\\N"} else value
+
+
+def fetch_latest_ai_etf_holdings(args: argparse.Namespace, trade_date: str, adjust_type: str) -> list[dict[str, Any]]:
+    if not trade_date:
+        return []
+    sql = f"""
+SELECT
+  stock_code,
+  stock_name,
+  industry,
+  target_weight_pct,
+  reference_price,
+  simulated_quantity,
+  simulated_notional
+FROM stock_ai_etf_holding
+WHERE portfolio_name = {sql_text(AI_ETF_PORTFOLIO_NAME)}
+  AND adjust_type = {sql_text(adjust_type)}
+  AND trade_date = (
+    SELECT MAX(trade_date)
+    FROM stock_ai_etf_holding
+    WHERE portfolio_name = {sql_text(AI_ETF_PORTFOLIO_NAME)}
+      AND adjust_type = {sql_text(adjust_type)}
+      AND trade_date < {sql_date(trade_date)}
+  )
+  AND target_weight_pct > 0
+ORDER BY stock_code;
+"""
+    output = query_mysql(sql, args, use_database=True)
+    holdings = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        cells = line.split("\t")
+        if len(cells) != 7:
+            continue
+        holdings.append(
+            {
+                "stock_code": cells[0],
+                "stock_name": parse_mysql_nullable(cells[1]),
+                "industry": parse_mysql_nullable(cells[2]),
+                "target_weight_pct": number(parse_mysql_nullable(cells[3])),
+                "reference_price": number(parse_mysql_nullable(cells[4])),
+                "simulated_quantity": number(parse_mysql_nullable(cells[5])),
+                "simulated_notional": number(parse_mysql_nullable(cells[6])),
+            }
+        )
+    return holdings
+
+
 def fetch_evaluation_summaries(args: argparse.Namespace, stock_codes: list[str], adjust_type: str) -> dict[str, Any]:
     if not stock_codes:
         return {}
@@ -785,6 +1221,22 @@ def iter_dates(start: dt.date, end: dt.date) -> list[dt.date]:
     return [start + dt.timedelta(days=offset) for offset in range(days + 1)]
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须是正整数") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return parsed
+
+
+def chunked(values: list[str], batch_size: int | None) -> list[list[str]]:
+    if not batch_size:
+        return [values]
+    return [values[index : index + batch_size] for index in range(0, len(values), batch_size)]
+
+
 def requested_as_of_dates(args: argparse.Namespace) -> list[dt.date | None]:
     if args.backfill_from or args.backfill_to:
         if not args.backfill_from or not args.backfill_to:
@@ -827,7 +1279,18 @@ def analyze_results(args: argparse.Namespace, scorer: Any) -> list[dict[str, Any
 
 
 def persist_results(results: list[dict[str, Any]], args: argparse.Namespace) -> None:
-    run_mysql(build_persist_sql(results, args.adjust, include_reports=False), args, use_database=True)
+    trade_dates = sorted({analysis_trade_date(result) for result in results if analysis_trade_date(result)})
+    previous_holdings = fetch_latest_ai_etf_holdings(args, trade_dates[-1], args.adjust) if trade_dates else []
+    run_mysql(
+        build_persist_sql(
+            results,
+            args.adjust,
+            include_reports=False,
+            previous_ai_etf_holdings=previous_holdings,
+        ),
+        args,
+        use_database=True,
+    )
     run_mysql(refresh_signal_outcomes_sql(), args, use_database=True)
     stock_codes = [str(result["code"]) for result in results]
     summaries = fetch_evaluation_summaries(args, stock_codes, args.adjust)
@@ -836,9 +1299,14 @@ def persist_results(results: list[dict[str, Any]], args: argparse.Namespace) -> 
     run_mysql(build_report_sql(results, args.adjust), args, use_database=True)
 
 
-def upload_results(results: list[dict[str, Any]], args: argparse.Namespace, adjust_type: str) -> dict[str, Any]:
+def upload_results(
+    results: list[dict[str, Any]],
+    args: argparse.Namespace,
+    adjust_type: str,
+    ai_etf: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     token = getattr(args, "ingest_token", "") or os.environ.get("INGEST_API_TOKEN", "") or DEFAULT_INGEST_API_TOKEN
-    payload = json.dumps({"adjustType": adjust_type, "results": results}, ensure_ascii=False).encode("utf-8")
+    payload = json.dumps({"adjustType": adjust_type, "results": results, "aiEtf": ai_etf}, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         getattr(args, "ingest_url"),
         data=payload,
@@ -943,6 +1411,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--backfill-to", type=parse_arg_date, help="历史回填结束日期，需与 --backfill-from 同时使用")
     parser.add_argument("--ingest-url", default="", help="通过 Express ingest 接口上报分析结果，传入后不直连本地 MySQL")
     parser.add_argument("--ingest-token", default="", help="Express ingest 接口 Bearer Token；也可用 INGEST_API_TOKEN")
+    parser.add_argument("--batch-size", type=positive_int, help="按指定数量分批分析并写入/上报，例如 10 表示每 10 只提交一次")
     parser.add_argument("--skip-eastmoney", action="store_true", help="跳过 Eastmoney 实时概要/估值接口，直接使用降级数据源")
     parser.add_argument("--preflight", action="store_true", help="只检查运行环境、代码文件和生产服务健康，不抓取或写入股票数据")
     parser.add_argument("--quiet", action="store_true", help="关闭进度日志，仅保留最终结果或错误")
@@ -966,29 +1435,45 @@ def main(argv: list[str]) -> int:
         seen_keys: set[tuple[str, str]] = set()
         all_results: list[dict[str, Any]] = []
         dry_run_parts: list[str] = []
+        resolved_codes = sfa.resolve_input_codes(args.codes, args.codes_file) if args.batch_size else None
+        code_names = {} if args.codes or not args.batch_size else sfa.load_code_names_from_file(args.codes_file)
         for as_of_date in as_of_dates:
             run_args = argparse.Namespace(**vars(args))
             run_args.as_of_date = as_of_date
-            results = analyze_results(run_args, scorer)
-            if args.backfill_from or args.backfill_to:
-                results = filter_new_trade_date_results(results, seen_keys)
-            if not results:
+            batches = chunked(resolved_codes, args.batch_size) if resolved_codes is not None else [None]
+            date_had_results = False
+            for batch_index, batch_codes in enumerate(batches, start=1):
+                if batch_codes is not None:
+                    run_args = argparse.Namespace(**vars(args))
+                    run_args.as_of_date = as_of_date
+                    run_args.resolved_codes = batch_codes
+                    run_args.code_names = code_names
+                    log_status(args, f"开始处理第 {batch_index}/{len(batches)} 批：{len(batch_codes)} 只股票")
+                results = analyze_results(run_args, scorer)
+                if args.backfill_from or args.backfill_to:
+                    results = filter_new_trade_date_results(results, seen_keys)
+                if not results:
+                    continue
+                date_had_results = True
+                if args.dry_run:
+                    dry_run_parts.append(render_dry_run_sql(results, args.adjust))
+                elif args.ingest_url:
+                    batch_label = f"第 {batch_index}/{len(batches)} 批，" if batch_codes is not None else ""
+                    log_status(args, f"开始上报生产 ingest：{batch_label}{len(results)} 条结果")
+                    ai_etf = build_ai_etf_portfolio(results, args.adjust)
+                    upload_response = upload_results(results, run_args, args.adjust, ai_etf=ai_etf)
+                    persisted_count = upload_response.get("persistedCount")
+                    suffix = f"，persistedCount={persisted_count}" if persisted_count is not None else ""
+                    log_status(args, f"生产 ingest 上报完成{suffix}")
+                else:
+                    batch_label = f"第 {batch_index}/{len(batches)} 批，" if batch_codes is not None else ""
+                    log_status(args, f"开始写入本地 MySQL：{batch_label}{len(results)} 条结果")
+                    persist_results(results, run_args)
+                    log_status(args, "本地 MySQL 写入完成")
+                all_results.extend(results)
+            if not date_had_results:
                 label = f"{as_of_date:%Y-%m-%d}" if as_of_date else "本次运行"
                 print(f"{label} 无新的交易日快照，已跳过")
-                continue
-            if args.dry_run:
-                dry_run_parts.append(render_dry_run_sql(results, args.adjust))
-            elif args.ingest_url:
-                log_status(args, f"开始上报生产 ingest：{len(results)} 条结果")
-                upload_response = upload_results(results, run_args, args.adjust)
-                persisted_count = upload_response.get("persistedCount")
-                suffix = f"，persistedCount={persisted_count}" if persisted_count is not None else ""
-                log_status(args, f"生产 ingest 上报完成{suffix}")
-            else:
-                log_status(args, f"开始写入本地 MySQL：{len(results)} 条结果")
-                persist_results(results, run_args)
-                log_status(args, "本地 MySQL 写入完成")
-            all_results.extend(results)
         if args.dry_run:
             print("\n".join(dry_run_parts), end="")
             return 0

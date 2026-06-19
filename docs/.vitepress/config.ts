@@ -7,7 +7,10 @@ export default defineConfig({
   lastUpdated: false,
   themeConfig: {
     logo: '/logo.svg',
-    nav: [{ text: '分析看板', link: '/' }],
+    nav: [
+      { text: '分析看板', link: '/' },
+      { text: 'AI 推荐 ETF', link: '/analysis/ai-etf' },
+    ],
     sidebar: false,
     search: {
       provider: 'local',

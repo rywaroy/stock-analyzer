@@ -84,6 +84,63 @@ function sampleResult() {
   };
 }
 
+function sampleAiEtf() {
+  return {
+    portfolioName: 'AI_RECOMMENDED_ETF',
+    tradeDate: '2026-06-12',
+    adjustType: 'qfq',
+    selectionRule: '首次生成，10 只股票等权配置。',
+    nav: 1000000,
+    dailyReturnPct: 0,
+    cumulativeReturnPct: 0,
+    realizedPnl: 0,
+    unrealizedPnl: 0,
+    totalPnl: 0,
+    turnoverPct: 100,
+    holdings: [
+      {
+        stockCode: '002466',
+        stockName: '天齐锂业',
+        industry: '能源金属',
+        previousWeightPct: 0,
+        targetWeightPct: 10,
+        weightDeltaPct: 10,
+        action: 'buy',
+        referencePrice: 62.5,
+        simulatedQuantity: 1600,
+        simulatedNotional: 100000,
+        score: 5,
+        shortTermScore: -8,
+        mediumTermScore: 6,
+        longTermScore: 18,
+        signalLabel: '观望',
+        shortTermSignalLabel: '观望',
+        mediumTermSignalLabel: '观望',
+        longTermSignalLabel: '买入偏向',
+        confidence: '低',
+        rationale: '测试选择理由',
+        risks: ['测试风险'],
+      },
+    ],
+    rebalance: [
+      {
+        stockCode: '002466',
+        stockName: '天齐锂业',
+        action: 'buy',
+        previousWeightPct: 0,
+        targetWeightPct: 10,
+        weightDeltaPct: 10,
+        referencePrice: 62.5,
+        simulatedQuantityDelta: 1600,
+        simulatedNotionalDelta: 100000,
+        realizedPnl: 0,
+        realizedReturnPct: 0,
+        reason: '新纳入组合',
+      },
+    ],
+  };
+}
+
 function createRecordingPool() {
   const calls = [];
   const connection = {
@@ -110,6 +167,77 @@ function createRecordingPool() {
           ],
         ];
       }
+      if (sql.includes('FROM stock_ai_etf_snapshot')) {
+        return [
+          [
+            {
+              portfolioName: 'AI_RECOMMENDED_ETF',
+              tradeDate: '2026-06-12',
+              adjustType: 'qfq',
+              selectionRule: '首次生成，10 只股票等权配置。',
+              nav: 1000000,
+              dailyReturnPct: 0,
+              cumulativeReturnPct: 0,
+              realizedPnl: 0,
+              unrealizedPnl: 0,
+              totalPnl: 0,
+              turnoverPct: 100,
+              holdingCount: 1,
+              summary_json: JSON.stringify({ note: '测试' }),
+              updatedAt: '2026-06-12 18:00:00',
+            },
+          ],
+        ];
+      }
+      if (sql.includes('FROM stock_ai_etf_holding')) {
+        return [
+          [
+            {
+              portfolioName: 'AI_RECOMMENDED_ETF',
+              tradeDate: '2026-06-12',
+              stockCode: '002466',
+              stockName: '天齐锂业',
+              industry: '能源金属',
+              previousWeightPct: 0,
+              targetWeightPct: 10,
+              weightDeltaPct: 10,
+              action: 'buy',
+              referencePrice: 62.5,
+              simulatedQuantity: 1600,
+              simulatedNotional: 100000,
+              score: 5,
+              shortTermScore: -8,
+              mediumTermScore: 6,
+              longTermScore: 18,
+              confidence: '低',
+              rationale: '测试选择理由',
+              risks_json: JSON.stringify(['测试风险']),
+            },
+          ],
+        ];
+      }
+      if (sql.includes('FROM stock_ai_etf_trade')) {
+        return [
+          [
+            {
+              portfolioName: 'AI_RECOMMENDED_ETF',
+              tradeDate: '2026-06-12',
+              stockCode: '002466',
+              stockName: '天齐锂业',
+              action: 'buy',
+              previousWeightPct: 0,
+              targetWeightPct: 10,
+              weightDeltaPct: 10,
+              referencePrice: 62.5,
+              simulatedQuantityDelta: 1600,
+              simulatedNotionalDelta: 100000,
+              realizedPnl: 0,
+              realizedReturnPct: 0,
+              reason: '新纳入组合',
+            },
+          ],
+        ];
+      }
       return [[]];
     },
     async commit() {
@@ -128,8 +256,11 @@ function createRecordingPool() {
       calls.push({ type: 'getConnection' });
       return connection;
     },
-    async query() {
-      return [[{ ok: 1 }]];
+    async query(sql, params = []) {
+      if (sql === 'SELECT 1 AS ok') {
+        return [[{ ok: 1 }]];
+      }
+      return connection.query(sql, params);
     },
   };
 }
@@ -255,4 +386,44 @@ test('POST /api/ingest/daily-analysis persists results and refreshes reports in 
     pool.calls.some((call) => call.type === 'query' && call.params.some((param) => String(param).includes('## 历史验证'))),
     true,
   );
+});
+
+test('POST /api/ingest/daily-analysis persists optional AI ETF payload', async () => {
+  const pool = createRecordingPool();
+  const app = createApp({ pool, ingestToken: 'secret', projectRootPath: '/tmp/no-static-dist' });
+
+  await withServer(app, async (server) => {
+    const response = await postJson(
+      server,
+      '/api/ingest/daily-analysis',
+      { adjustType: 'qfq', results: [sampleResult()], aiEtf: sampleAiEtf() },
+      { authorization: 'Bearer secret' },
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.aiEtf?.portfolioName, 'AI_RECOMMENDED_ETF');
+    assert.equal(response.body.aiEtf?.holdingCount, 1);
+  });
+
+  const sqlText = pool.calls.filter((call) => call.type === 'query').map((call) => call.sql).join('\n');
+  assert.match(sqlText, /INSERT INTO stock_ai_etf_snapshot/);
+  assert.match(sqlText, /INSERT INTO stock_ai_etf_holding/);
+  assert.match(sqlText, /INSERT INTO stock_ai_etf_trade/);
+});
+
+test('GET /api/ai-etf returns latest portfolio snapshot with holdings and rebalance', async () => {
+  const app = createApp({ pool: createRecordingPool(), projectRootPath: '/tmp/no-static-dist' });
+
+  await withServer(app, async (server) => {
+    const address = server.address();
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/ai-etf`, {
+      signal: AbortSignal.timeout(1000),
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.snapshot.portfolioName, 'AI_RECOMMENDED_ETF');
+    assert.equal(body.holdings[0].action, 'buy');
+    assert.equal(body.rebalance[0].action, 'buy');
+  });
 });

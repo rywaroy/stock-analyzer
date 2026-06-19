@@ -30,6 +30,43 @@ from stock_fundamental_analysis import (
 SCORER_PATH = Path(__file__).resolve().parents[1] / ".codex/skills/stock-buy-signal-analysis/scripts/analyze_stock.py"
 
 
+def make_ai_etf_result(index: int, trade_date: str = "2026-06-12") -> dict:
+    code = f"{index:06d}"
+    score = 80 - index
+    return {
+        "code": code,
+        "name": f"测试股票{index}",
+        "score": score,
+        "signal": "买入偏向" if score >= 15 else "观望",
+        "confidence": "高" if index % 3 else "中",
+        "regime": "trend",
+        "advice": "测试建议",
+        "horizon_scores": {
+            "short_term": {"label": "短期", "score": 30 - index, "signal": "买入偏向"},
+            "medium_term": {"label": "中期", "score": 60 - index, "signal": "买入偏向"},
+            "long_term": {"label": "长期", "score": 70 - index, "signal": "买入偏向"},
+        },
+        "parts": [],
+        "source_errors": [],
+        "raw": {
+            "code": code,
+            "name": f"测试股票{index}",
+            "industry": "测试行业",
+            "listed_at": "2020-01-01",
+            "report_date": "2026-03-31",
+            "overview": {},
+            "technical": {
+                "trade_date": trade_date,
+                "latest_close": 10 + index,
+            },
+            "technical_trend": {"rating": "技术趋势偏强", "score": 60 - index, "windows": []},
+            "metrics": [],
+            "strengths": [f"优势{index}"],
+            "risks": [f"风险{index}"],
+        },
+    }
+
+
 def load_signal_scorer():
     spec = importlib.util.spec_from_file_location("stock_buy_signal_scorer", SCORER_PATH)
     if spec is None or spec.loader is None:
@@ -1018,6 +1055,47 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertIn("window_days", sql)
         self.assertIn("raw_signal_json", sql)
 
+    def test_build_ai_etf_portfolio_selects_ten_equal_weight_initial_holdings(self):
+        results = [make_ai_etf_result(index) for index in range(12)]
+
+        portfolio = mysql_sink.build_ai_etf_portfolio(results, "qfq")
+
+        self.assertEqual(portfolio["portfolioName"], "AI_RECOMMENDED_ETF")
+        self.assertEqual(portfolio["tradeDate"], "2026-06-12")
+        self.assertEqual(len(portfolio["holdings"]), 10)
+        self.assertEqual(sum(holding["targetWeightPct"] for holding in portfolio["holdings"]), 100.0)
+        self.assertTrue(all(holding["targetWeightPct"] == 10.0 for holding in portfolio["holdings"]))
+        self.assertTrue(all(holding["action"] == "buy" for holding in portfolio["holdings"]))
+        self.assertEqual(portfolio["holdings"][0]["stockCode"], "000000")
+        self.assertIn("首次", portfolio["selectionRule"])
+
+    def test_build_ai_etf_portfolio_marks_rebalance_actions_from_previous_holdings(self):
+        results = [make_ai_etf_result(index) for index in range(12)]
+        previous_holdings = [
+            {"stock_code": "000000", "target_weight_pct": 8, "reference_price": 9, "simulated_quantity": 8000},
+            {"stock_code": "000001", "target_weight_pct": 12, "reference_price": 10, "simulated_quantity": 12000},
+            {"stock_code": "999999", "target_weight_pct": 10, "reference_price": 20, "simulated_quantity": 5000},
+        ]
+
+        portfolio = mysql_sink.build_ai_etf_portfolio(results, "qfq", previous_holdings=previous_holdings)
+        actions = {item["stockCode"]: item["action"] for item in portfolio["rebalance"]}
+
+        self.assertEqual(actions["999999"], "sell")
+        self.assertIn(actions["000000"], {"increase", "hold"})
+        self.assertIn(actions["000001"], {"reduce", "hold"})
+        self.assertTrue(any(item["action"] == "buy" for item in portfolio["rebalance"]))
+        self.assertTrue(all("weightDeltaPct" in item for item in portfolio["rebalance"]))
+
+    def test_build_persist_sql_includes_ai_etf_upserts(self):
+        results = [make_ai_etf_result(index) for index in range(10)]
+
+        sql = mysql_sink.build_persist_sql(results, "qfq")
+
+        self.assertIn("INSERT INTO stock_ai_etf_snapshot", sql)
+        self.assertIn("INSERT INTO stock_ai_etf_holding", sql)
+        self.assertIn("INSERT INTO stock_ai_etf_trade", sql)
+        self.assertIn("portfolio_name", sql)
+
     def test_refresh_signal_outcomes_sql_uses_future_trading_day_window(self):
         sql = mysql_sink.refresh_signal_outcomes_sql()
 
@@ -1065,9 +1143,36 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertEqual(captured["url"], args.ingest_url)
         self.assertEqual(captured["headers"]["Authorization"], "Bearer secret")
         self.assertEqual(captured["headers"]["Content-type"], "application/json")
-        self.assertEqual(captured["payload"], {"adjustType": "qfq", "results": [result]})
+        self.assertEqual(captured["payload"], {"adjustType": "qfq", "results": [result], "aiEtf": None})
         self.assertEqual(captured["timeout"], 60)
         self.assertEqual(response["persistedCount"], 1)
+
+    def test_upload_results_posts_ai_etf_payload_when_available(self):
+        args = SimpleNamespace(ingest_url="https://stock.example.com/api/ingest/daily-analysis", ingest_token="secret")
+        results = [make_ai_etf_result(index) for index in range(10)]
+        ai_etf = mysql_sink.build_ai_etf_portfolio(results, "qfq")
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"ok":true,"persistedCount":10}'
+
+        def fake_urlopen(request, timeout):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            mysql_sink.upload_results(results, args, "qfq", ai_etf=ai_etf)
+
+        self.assertEqual(captured["payload"]["aiEtf"]["portfolioName"], "AI_RECOMMENDED_ETF")
+        self.assertEqual(len(captured["payload"]["aiEtf"]["holdings"]), 10)
+        self.assertEqual(captured["payload"]["aiEtf"]["holdings"][0]["action"], "buy")
 
     def test_upload_results_uses_default_ingest_token(self):
         args = SimpleNamespace(ingest_url="https://stock.example.com/api/ingest/daily-analysis", ingest_token="")
@@ -1145,6 +1250,50 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertEqual(uploaded_results, [result])
         self.assertEqual(uploaded_args.ingest_token, "secret")
         self.assertEqual(adjust_type, "qfq")
+
+    def test_main_uploads_results_in_batches_when_batch_size_is_set(self):
+        items = [{"code": f"{index:06d}"} for index in range(25)]
+
+        def score_item(item):
+            return {
+                "code": item["code"],
+                "score": 5,
+                "signal": "观望",
+                "confidence": "低",
+                "raw": {"technical": {"trade_date": "2026-06-12"}},
+            }
+
+        scorer = SimpleNamespace(score_item=score_item)
+
+        def fetch_batch(args):
+            return [{"code": code} for code in args.resolved_codes]
+
+        with (
+            patch.object(mysql_sink, "load_scorer", return_value=scorer),
+            patch.object(mysql_sink.sfa, "resolve_input_codes", return_value=[item["code"] for item in items]),
+            patch.object(mysql_sink, "fetch_analysis_items", side_effect=fetch_batch),
+            patch.object(mysql_sink, "ensure_schema") as ensure_schema_mock,
+            patch.object(mysql_sink, "persist_results") as persist_mock,
+            patch.object(mysql_sink, "upload_results", return_value={"ok": True}) as upload_mock,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            exit_code = mysql_sink.main(
+                [
+                    "--ingest-url",
+                    "https://stock.example.com/api/ingest/daily-analysis",
+                    "--batch-size",
+                    "10",
+                    "--quiet",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        ensure_schema_mock.assert_not_called()
+        persist_mock.assert_not_called()
+        uploaded_batches = [call.args[0] for call in upload_mock.call_args_list]
+        self.assertEqual([len(batch) for batch in uploaded_batches], [10, 10, 5])
+        self.assertEqual(uploaded_batches[0][0]["code"], "000000")
+        self.assertEqual(uploaded_batches[-1][-1]["code"], "000024")
 
 
 if __name__ == "__main__":

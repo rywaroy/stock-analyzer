@@ -233,6 +233,72 @@ export function createApp({
     };
   }
 
+  function mapAiEtfSnapshot(row) {
+    return {
+      portfolioName: row.portfolioName,
+      tradeDate: row.tradeDate,
+      adjustType: row.adjustType,
+      selectionRule: row.selectionRule || "",
+      nav: toNumber(row.nav),
+      dailyReturnPct: toNumber(row.dailyReturnPct),
+      cumulativeReturnPct: toNumber(row.cumulativeReturnPct),
+      realizedPnl: toNumber(row.realizedPnl),
+      unrealizedPnl: toNumber(row.unrealizedPnl),
+      totalPnl: toNumber(row.totalPnl),
+      turnoverPct: toNumber(row.turnoverPct),
+      holdingCount: Number(row.holdingCount || 0),
+      summary: parseJson(row.summary_json, {}),
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  function mapAiEtfHolding(row) {
+    return {
+      portfolioName: row.portfolioName,
+      tradeDate: row.tradeDate,
+      stockCode: row.stockCode,
+      stockName: row.stockName || "",
+      industry: row.industry || "",
+      previousWeightPct: toNumber(row.previousWeightPct),
+      targetWeightPct: toNumber(row.targetWeightPct),
+      weightDeltaPct: toNumber(row.weightDeltaPct),
+      action: row.action,
+      referencePrice: toNumber(row.referencePrice),
+      simulatedQuantity: toNumber(row.simulatedQuantity),
+      simulatedNotional: toNumber(row.simulatedNotional),
+      score: toNumber(row.score),
+      signalLabel: row.signalLabel || "",
+      shortTermScore: toNumber(row.shortTermScore),
+      shortTermSignalLabel: row.shortTermSignalLabel || "",
+      mediumTermScore: toNumber(row.mediumTermScore),
+      mediumTermSignalLabel: row.mediumTermSignalLabel || "",
+      longTermScore: toNumber(row.longTermScore),
+      longTermSignalLabel: row.longTermSignalLabel || "",
+      confidence: row.confidence || "",
+      rationale: row.rationale || "",
+      risks: parseJson(row.risks_json, []),
+    };
+  }
+
+  function mapAiEtfTrade(row) {
+    return {
+      portfolioName: row.portfolioName,
+      tradeDate: row.tradeDate,
+      stockCode: row.stockCode,
+      stockName: row.stockName || "",
+      action: row.action,
+      previousWeightPct: toNumber(row.previousWeightPct),
+      targetWeightPct: toNumber(row.targetWeightPct),
+      weightDeltaPct: toNumber(row.weightDeltaPct),
+      referencePrice: toNumber(row.referencePrice),
+      simulatedQuantityDelta: toNumber(row.simulatedQuantityDelta),
+      simulatedNotionalDelta: toNumber(row.simulatedNotionalDelta),
+      realizedPnl: toNumber(row.realizedPnl),
+      realizedReturnPct: toNumber(row.realizedReturnPct),
+      reason: row.reason || "",
+    };
+  }
+
   async function loadDateSummaries() {
     const [rows] = await pool.query(`
     SELECT
@@ -886,7 +952,154 @@ ORDER BY stock_code, horizon, window_days
     );
   }
 
-  async function persistIngestResults(connection, results, adjustType) {
+  async function persistAiEtf(connection, aiEtf, adjustType) {
+    if (!aiEtf) {
+      return null;
+    }
+    const portfolioName = aiEtf.portfolioName || "AI_RECOMMENDED_ETF";
+    const tradeDate = aiEtf.tradeDate;
+    if (!tradeDate) {
+      const error = new Error("aiEtf.tradeDate 不能为空");
+      error.statusCode = 400;
+      throw error;
+    }
+    validateTradeDate(tradeDate);
+    const effectiveAdjustType = aiEtf.adjustType || adjustType;
+    await upsert(
+      connection,
+      "stock_ai_etf_snapshot",
+      {
+        portfolio_name: portfolioName,
+        trade_date: tradeDate,
+        adjust_type: effectiveAdjustType,
+        selection_rule: aiEtf.selectionRule || null,
+        nav: numberOrNull(aiEtf.nav),
+        daily_return_pct: numberOrNull(aiEtf.dailyReturnPct),
+        cumulative_return_pct: numberOrNull(aiEtf.cumulativeReturnPct),
+        realized_pnl: numberOrNull(aiEtf.realizedPnl),
+        unrealized_pnl: numberOrNull(aiEtf.unrealizedPnl),
+        total_pnl: numberOrNull(aiEtf.totalPnl),
+        turnover_pct: numberOrNull(aiEtf.turnoverPct),
+        holding_count: intOrNull(aiEtf.holdingCount ?? aiEtf.holdings?.filter((item) => Number(item.targetWeightPct) > 0).length ?? 0),
+        summary_json: jsonValue(aiEtf.summary || {}),
+      },
+      [
+        "selection_rule",
+        "nav",
+        "daily_return_pct",
+        "cumulative_return_pct",
+        "realized_pnl",
+        "unrealized_pnl",
+        "total_pnl",
+        "turnover_pct",
+        "holding_count",
+        "summary_json",
+      ],
+    );
+
+    for (const holding of aiEtf.holdings || []) {
+      await upsert(
+        connection,
+        "stock_ai_etf_holding",
+        {
+          portfolio_name: portfolioName,
+          trade_date: tradeDate,
+          adjust_type: effectiveAdjustType,
+          stock_code: String(holding.stockCode),
+          stock_name: holding.stockName || null,
+          industry: holding.industry || null,
+          previous_weight_pct: numberOrNull(holding.previousWeightPct),
+          target_weight_pct: numberOrNull(holding.targetWeightPct),
+          weight_delta_pct: numberOrNull(holding.weightDeltaPct),
+          action: holding.action || "hold",
+          reference_price: numberOrNull(holding.referencePrice),
+          simulated_quantity: numberOrNull(holding.simulatedQuantity),
+          simulated_notional: numberOrNull(holding.simulatedNotional),
+          score: intOrNull(holding.score),
+          signal_label: holding.signalLabel || null,
+          short_term_score: intOrNull(holding.shortTermScore),
+          short_term_signal_label: holding.shortTermSignalLabel || null,
+          medium_term_score: intOrNull(holding.mediumTermScore),
+          medium_term_signal_label: holding.mediumTermSignalLabel || null,
+          long_term_score: intOrNull(holding.longTermScore),
+          long_term_signal_label: holding.longTermSignalLabel || null,
+          confidence: holding.confidence || null,
+          rationale: holding.rationale || null,
+          risks_json: jsonValue(holding.risks || []),
+          raw_json: jsonValue(holding),
+        },
+        [
+          "stock_name",
+          "industry",
+          "previous_weight_pct",
+          "target_weight_pct",
+          "weight_delta_pct",
+          "action",
+          "reference_price",
+          "simulated_quantity",
+          "simulated_notional",
+          "score",
+          "signal_label",
+          "short_term_score",
+          "short_term_signal_label",
+          "medium_term_score",
+          "medium_term_signal_label",
+          "long_term_score",
+          "long_term_signal_label",
+          "confidence",
+          "rationale",
+          "risks_json",
+          "raw_json",
+        ],
+      );
+    }
+
+    for (const trade of aiEtf.rebalance || []) {
+      await upsert(
+        connection,
+        "stock_ai_etf_trade",
+        {
+          portfolio_name: portfolioName,
+          trade_date: tradeDate,
+          adjust_type: effectiveAdjustType,
+          stock_code: String(trade.stockCode),
+          stock_name: trade.stockName || null,
+          action: trade.action || "hold",
+          previous_weight_pct: numberOrNull(trade.previousWeightPct),
+          target_weight_pct: numberOrNull(trade.targetWeightPct),
+          weight_delta_pct: numberOrNull(trade.weightDeltaPct),
+          reference_price: numberOrNull(trade.referencePrice),
+          simulated_quantity_delta: numberOrNull(trade.simulatedQuantityDelta),
+          simulated_notional_delta: numberOrNull(trade.simulatedNotionalDelta),
+          realized_pnl: numberOrNull(trade.realizedPnl),
+          realized_return_pct: numberOrNull(trade.realizedReturnPct),
+          reason: trade.reason || null,
+          raw_json: jsonValue(trade),
+        },
+        [
+          "stock_name",
+          "previous_weight_pct",
+          "target_weight_pct",
+          "weight_delta_pct",
+          "reference_price",
+          "simulated_quantity_delta",
+          "simulated_notional_delta",
+          "realized_pnl",
+          "realized_return_pct",
+          "reason",
+          "raw_json",
+        ],
+      );
+    }
+
+    return {
+      portfolioName,
+      tradeDate,
+      holdingCount: Number(aiEtf.holdingCount || aiEtf.holdings?.filter((item) => Number(item.targetWeightPct) > 0).length || 0),
+    };
+  }
+
+  async function persistIngestResults(connection, results, adjustType, aiEtf = null) {
     const persistedCodes = [];
     for (const result of results) {
       const item = result.raw || {};
@@ -930,6 +1143,7 @@ ORDER BY stock_code, horizon, window_days
         summaries[String(result.code)] || emptyEvaluationSummary();
       await persistReport(connection, result, adjustType);
     }
+    return persistAiEtf(connection, aiEtf, adjustType);
   }
 
   app.get("/api/health", asyncHandler(async (_req, res) => {
@@ -943,6 +1157,137 @@ ORDER BY stock_code, horizon, window_days
   app.get("/api/dates", asyncHandler(async (_req, res) => {
     const dates = await loadDateSummaries();
     res.json({ dates });
+  }));
+
+  app.get("/api/ai-etf/dates", asyncHandler(async (_req, res) => {
+    const [rows] = await pool.query(`
+      SELECT
+        DATE_FORMAT(trade_date, '%Y-%m-%d') AS tradeDate,
+        portfolio_name AS portfolioName,
+        adjust_type AS adjustType,
+        holding_count AS holdingCount,
+        turnover_pct AS turnoverPct,
+        total_pnl AS totalPnl,
+        DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') AS updatedAt
+      FROM stock_ai_etf_snapshot
+      ORDER BY trade_date DESC, updated_at DESC
+    `);
+    res.json({
+      dates: rows.map((row) => ({
+        tradeDate: row.tradeDate,
+        portfolioName: row.portfolioName,
+        adjustType: row.adjustType,
+        holdingCount: Number(row.holdingCount || 0),
+        turnoverPct: toNumber(row.turnoverPct),
+        totalPnl: toNumber(row.totalPnl),
+        updatedAt: row.updatedAt,
+      })),
+    });
+  }));
+
+  app.get("/api/ai-etf", asyncHandler(async (req, res) => {
+    const tradeDate = req.query.date
+      ? validateTradeDate(String(req.query.date))
+      : null;
+    const snapshotParams = [];
+    const snapshotWhere = tradeDate ? "WHERE trade_date = ?" : "";
+    if (tradeDate) {
+      snapshotParams.push(tradeDate);
+    }
+    const [snapshotRows] = await pool.query(
+      `
+      SELECT
+        portfolio_name AS portfolioName,
+        DATE_FORMAT(trade_date, '%Y-%m-%d') AS tradeDate,
+        adjust_type AS adjustType,
+        selection_rule AS selectionRule,
+        nav,
+        daily_return_pct AS dailyReturnPct,
+        cumulative_return_pct AS cumulativeReturnPct,
+        realized_pnl AS realizedPnl,
+        unrealized_pnl AS unrealizedPnl,
+        total_pnl AS totalPnl,
+        turnover_pct AS turnoverPct,
+        holding_count AS holdingCount,
+        summary_json,
+        DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') AS updatedAt
+      FROM stock_ai_etf_snapshot
+      ${snapshotWhere}
+      ORDER BY trade_date DESC, updated_at DESC
+      LIMIT 1
+    `,
+      snapshotParams,
+    );
+    if (!snapshotRows.length) {
+      res.json({ snapshot: null, holdings: [], rebalance: [] });
+      return;
+    }
+    const snapshot = mapAiEtfSnapshot(snapshotRows[0]);
+    const commonParams = [snapshot.portfolioName, snapshot.tradeDate, snapshot.adjustType];
+    const [holdingRows] = await pool.query(
+      `
+      SELECT
+        portfolio_name AS portfolioName,
+        DATE_FORMAT(trade_date, '%Y-%m-%d') AS tradeDate,
+        stock_code AS stockCode,
+        stock_name AS stockName,
+        industry,
+        previous_weight_pct AS previousWeightPct,
+        target_weight_pct AS targetWeightPct,
+        weight_delta_pct AS weightDeltaPct,
+        action,
+        reference_price AS referencePrice,
+        simulated_quantity AS simulatedQuantity,
+        simulated_notional AS simulatedNotional,
+        score,
+        signal_label AS signalLabel,
+        short_term_score AS shortTermScore,
+        short_term_signal_label AS shortTermSignalLabel,
+        medium_term_score AS mediumTermScore,
+        medium_term_signal_label AS mediumTermSignalLabel,
+        long_term_score AS longTermScore,
+        long_term_signal_label AS longTermSignalLabel,
+        confidence,
+        rationale,
+        risks_json
+      FROM stock_ai_etf_holding
+      WHERE portfolio_name = ?
+        AND trade_date = ?
+        AND adjust_type = ?
+      ORDER BY target_weight_pct DESC, stock_code ASC
+    `,
+      commonParams,
+    );
+    const [tradeRows] = await pool.query(
+      `
+      SELECT
+        portfolio_name AS portfolioName,
+        DATE_FORMAT(trade_date, '%Y-%m-%d') AS tradeDate,
+        stock_code AS stockCode,
+        stock_name AS stockName,
+        action,
+        previous_weight_pct AS previousWeightPct,
+        target_weight_pct AS targetWeightPct,
+        weight_delta_pct AS weightDeltaPct,
+        reference_price AS referencePrice,
+        simulated_quantity_delta AS simulatedQuantityDelta,
+        simulated_notional_delta AS simulatedNotionalDelta,
+        realized_pnl AS realizedPnl,
+        realized_return_pct AS realizedReturnPct,
+        reason
+      FROM stock_ai_etf_trade
+      WHERE portfolio_name = ?
+        AND trade_date = ?
+        AND adjust_type = ?
+      ORDER BY FIELD(action, 'buy', 'increase', 'reduce', 'sell', 'hold', 'watch'), stock_code ASC
+    `,
+      commonParams,
+    );
+    res.json({
+      snapshot,
+      holdings: holdingRows.map(mapAiEtfHolding),
+      rebalance: tradeRows.map(mapAiEtfTrade),
+    });
   }));
 
   app.get("/api/analysis", asyncHandler(async (req, res) => {
@@ -1231,6 +1576,7 @@ ORDER BY stock_code, horizon, window_days
       const results = Array.isArray(req.body?.results)
         ? req.body.results
         : null;
+      const aiEtf = req.body?.aiEtf || null;
       if (!["none", "qfq", "hfq"].includes(adjustType)) {
         const error = new Error("adjustType 只支持 none/qfq/hfq");
         error.statusCode = 400;
@@ -1242,9 +1588,10 @@ ORDER BY stock_code, horizon, window_days
         throw error;
       }
       const connection = await pool.getConnection();
+      let aiEtfResult = null;
       try {
         await connection.beginTransaction();
-        await persistIngestResults(connection, results, adjustType);
+        aiEtfResult = await persistIngestResults(connection, results, adjustType, aiEtf);
         await connection.commit();
       } catch (error) {
         await connection.rollback();
@@ -1256,6 +1603,7 @@ ORDER BY stock_code, horizon, window_days
         ok: true,
         adjustType,
         persistedCount: results.length,
+        aiEtf: aiEtfResult,
         items: results.map((result) => ({
           stockCode: String(result.code),
           tradeDate: result.raw?.technical?.trade_date || null,

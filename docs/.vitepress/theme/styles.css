@@ -239,6 +239,16 @@
   font-size: 13px;
 }
 
+.etf-rule {
+  border-radius: 8px;
+}
+
+.etf-delta {
+  display: block;
+  margin-top: 2px;
+  color: var(--stock-muted);
+}
+
 .analysis-card-antd .ant-table {
   color: var(--stock-text);
   font-size: 13px;

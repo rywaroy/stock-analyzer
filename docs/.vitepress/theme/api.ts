@@ -18,6 +18,15 @@ export function fetchAnalysis(date?: string) {
   return request(`/api/analysis${query}`);
 }
 
+export function fetchAiEtfDates() {
+  return request('/api/ai-etf/dates');
+}
+
+export function fetchAiEtf(date?: string) {
+  const query = date ? `?date=${encodeURIComponent(date)}` : '';
+  return request(`/api/ai-etf${query}`);
+}
+
 export function fetchStockDetail(stockCode: string, date?: string) {
   const params = new URLSearchParams();
   if (date) {
