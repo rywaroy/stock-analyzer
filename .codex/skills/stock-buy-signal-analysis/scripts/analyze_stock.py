@@ -308,6 +308,14 @@ def signal_label(score: int) -> str:
     return "强卖/回避"
 
 
+def signal_side_for_score(score: int) -> str:
+    if score >= 15:
+        return "buy_bias"
+    if score <= -15:
+        return "sell_avoid"
+    return "watch"
+
+
 def operation_advice(score: int, regime: str) -> str:
     if score >= 50:
         return "可考虑正向配置，但仍建议分批并设置失效条件。"
@@ -359,13 +367,14 @@ def score_horizons(
     data_penalty: float,
     regime: str,
     strategy_memory: dict[str, Any] | None = None,
+    strategy_factors: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     horizons: dict[str, dict[str, Any]] = {}
     applied_strategy_adjustments: list[dict[str, Any]] = []
     for key, definition in HORIZON_DEFINITIONS.items():
         weights = dict(definition["weights"])
         reasons = dict(definition["reasons"])
-        horizon_adjustments = matching_strategy_adjustments(strategy_memory, key, regime)
+        horizon_adjustments = matching_strategy_adjustments(strategy_memory, key, regime, strategy_factors)
         for adjustment in horizon_adjustments:
             adjustment_id = str(adjustment["id"])
             for component, multiplier in (adjustment.get("component_weight_multipliers") or {}).items():
@@ -376,14 +385,6 @@ def score_horizons(
                     raise ValueError(f"复盘 memory 权重倍数无效：{adjustment_id}.{component}")
                 weights[component] *= factor
                 reasons[component] = f"{reasons[component]}；复盘 {adjustment_id} 权重 x{factor:g}"
-            applied_strategy_adjustments.append(
-                {
-                    "id": adjustment_id,
-                    "horizon": key,
-                    "regime": regime,
-                    "reason": adjustment.get("reason", ""),
-                }
-            )
         parts = [
             {
                 "module": f"{definition['label']}基本面",
@@ -420,6 +421,48 @@ def score_horizons(
                     }
                 )
         score = clamp(sum(part["points"] for part in parts))
+        applied_adjustment_ids: set[str] = set()
+        for adjustment in horizon_adjustments:
+            adjustment_id = str(adjustment["id"])
+            if adjustment.get("component_weight_multipliers") or number(adjustment.get("score_bias")):
+                applied_adjustment_ids.add(adjustment_id)
+            if str(adjustment.get("score_adjustment_mode") or "") != "neutralize_to_watch":
+                continue
+            expected_side = str((adjustment.get("scope") or {}).get("signal_side") or "")
+            current_side = signal_side_for_score(score)
+            if expected_side and current_side != expected_side:
+                continue
+            boundary = number(adjustment.get("target_score_boundary"))
+            if current_side == "sell_avoid":
+                adjusted_score = max(score, clamp(boundary if boundary is not None else -14))
+            elif current_side == "buy_bias":
+                adjusted_score = min(score, clamp(boundary if boundary is not None else 14))
+            else:
+                continue
+            if adjusted_score == score:
+                continue
+            parts.append(
+                {
+                    "module": f"{definition['label']}复盘观察降级",
+                    "points": adjusted_score - score,
+                    "reason": f"复盘 {adjustment_id}: {adjustment.get('reason', '')}",
+                }
+            )
+            score = adjusted_score
+            applied_adjustment_ids.add(adjustment_id)
+        for adjustment in horizon_adjustments:
+            adjustment_id = str(adjustment["id"])
+            if adjustment_id not in applied_adjustment_ids:
+                continue
+            applied_strategy_adjustments.append(
+                {
+                    "id": adjustment_id,
+                    "horizon": key,
+                    "regime": regime,
+                    "mode": adjustment.get("score_adjustment_mode") or "score_bias",
+                    "reason": adjustment.get("reason", ""),
+                }
+            )
         horizons[key] = {
             "label": definition["label"],
             "score": score,
@@ -434,9 +477,11 @@ def matching_strategy_adjustments(
     strategy_memory: dict[str, Any] | None,
     horizon: str,
     regime: str,
+    strategy_factors: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     if not strategy_memory:
         return []
+    strategy_factors = strategy_factors or {}
     adjustments: list[dict[str, Any]] = []
     for adjustment in strategy_memory.get("active_adjustments", []):
         if adjustment.get("status", "active") != "active":
@@ -446,13 +491,26 @@ def matching_strategy_adjustments(
         scope = adjustment.get("scope") or {}
         horizons = scope.get("horizons") or list(HORIZON_DEFINITIONS)
         regimes = scope.get("regimes") or ["trend", "range", "downtrend", "mixed"]
-        if horizon in horizons and regime in regimes:
-            adjustments.append(adjustment)
+        if horizon not in horizons or regime not in regimes:
+            continue
+        scoped_factors = scope.get("factors") or {}
+        if any(str(strategy_factors.get(str(name)) or "") != str(value) for name, value in scoped_factors.items()):
+            continue
+        adjustments.append(adjustment)
     return adjustments
+
+
+def strategy_factor_tags(item: dict[str, Any], regime: str) -> dict[str, str]:
+    factors = {"regime": regime}
+    for source_key in ["factors", "strategy_factors"]:
+        for name, value in (item.get(source_key) or {}).items():
+            factors[str(name)] = str(value)
+    return factors
 
 
 def score_item(item: dict[str, Any], strategy_memory: dict[str, Any] | None = None) -> dict[str, Any]:
     regime = detect_regime(item)
+    strategy_factors = strategy_factor_tags(item, regime)
     fundamental_score, fundamental_parts = score_fundamentals(item)
     trend_score, trend_parts = score_trend(item)
     timing_score, timing_parts = score_timing(item, regime)
@@ -466,6 +524,7 @@ def score_item(item: dict[str, Any], strategy_memory: dict[str, Any] | None = No
         data_penalty,
         regime,
         memory,
+        strategy_factors,
     )
     parts = fundamental_parts + trend_parts + timing_parts
     if data_penalty:

@@ -101,6 +101,10 @@ mysql -uroot -D stock_analysis_test \
 
 4. Confirm `stock_signal_outcome` has the expected pending or matured rows for the analyzed stock/date when discussing historical validation.
 5. Read `references/review-memory.md` before explaining accuracy or strategy changes. The scorer automatically applies the JSON `active_adjustments` block to horizon scores; mention any `strategy_adjustments` returned in the scoring JSON. If an analysis proved inaccurate, append a new review log entry. Promote a candidate adjustment into the JSON block only when repeated matured evidence supports it.
+   When discussing strategy quality, weak-tail sell/avoid lag, 20/60-day horizon drift, or why a signal should be downgraded to watch, also read:
+   - `docs/research/stock-signal-best-strategy.md`
+   - `docs/research/stock-signal-final-review-learning-summary.md`
+   Treat these as human/Codex review guidance, not automatic score changes.
 6. Read `source_errors` from the report or `stock_daily_signal_score.source_errors_json`. If a data source failed, say which data is missing and reduce confidence instead of inventing values.
 7. Explain the short-term, medium-term, long-term, and overall scores using fundamentals, trend, timing, historical validation, review memory, and risk controls.
 8. Make a clear call for each score:
@@ -123,6 +127,39 @@ Use `references/review-memory.md` when reviewing inaccurate calls or adjusting s
 - Convert candidates to active JSON adjustments only with matured `stock_signal_outcome` evidence.
 - Prefer small horizon-scoped changes: MACD/KDJ timing weight, BOLL/RSI range weight, downtrend oversold penalty, or a small score bias.
 - Keep total score as a raw cross-check; review memory adjusts horizon scores used for decision explanation and ETF ranking.
+
+## Research-Backed Review Layer
+
+Use the latest research layer before making a final buy/sell/watch explanation. It is a review and confidence layer unless the JSON `active_adjustments` block explicitly contains a matching active rule.
+
+Primary references:
+
+- `docs/research/stock-signal-best-strategy.md`: the current layered strategy framework and manual scoring card.
+- `docs/research/stock-signal-final-review-learning-summary.md`: the evidence summary, data scope, old-vs-new logic comparison, and scenario playbook.
+
+Apply this review layer as follows:
+
+1. Keep horizon separation first. Do not let overall score override short-term, medium-term, and long-term scores.
+2. Identify market stage before interpreting stock indicators: trend extension, range repair, weak tail, bear-tail slow repair, or pure decline continuation.
+3. If the raw signal is sell/avoid in a weak-tail or bear-tail slow-repair state, do not treat it as automatically final. Review whether it is a short-window risk warning or a 60-day lagging sell signal.
+4. For weak-tail sell/avoid signals, explicitly check 20/60-day horizon logic when data is available. The most stable review lines are:
+   - 市场跌速加快+低位修复确认
+   - 市场修复质量未确认
+   - 市场低位待确认
+5. If one of those review lines is present, downgrade confidence in a strong sell/avoid explanation and prefer "观察/复核" wording unless active memory or fresh matured evidence says otherwise.
+6. Use market volume persistence before stock MACD repair when judging weak-tail recovery quality. Continuous market volume plus partial 20-day repair can reduce sell-lag confidence; pulse-like or discontinuous volume does not confirm risk relief.
+7. Do not convert weak-tail sell/avoid lag into a buy signal by itself. Upgrade to buy bias only when market stage, stock trend repair, technical quality, and long-term quality all support it.
+8. Keep unstable findings review-only: market-volume gates, speed-divergence counterexamples, repair-quality failure pockets, and any single-month or single-basket result must not become active scoring logic without new matured cross-period evidence.
+
+When improving or auditing this skill offline, use `research_signal_backtest.py` and inspect these report sections before promoting any rule:
+
+- `研究复核层新旧对照回放`: computable `review_layer_label/action/confidence` comparison against the raw signal.
+- `历史基本面覆盖度与缺口`: whether the replay avoided future fundamentals and where long-term quality evidence is still missing.
+- `研究复核层组合级验证`: equal-weight daily baskets for buy candidates and downgrade-to-watch opportunity baskets.
+- `股票池扩展与泛化验证`: current `--codes-file`, pool size, and the next pool needed for generalization.
+- `研究复核层失败案例库`: false downgrades, missed sell-lag cases, and review-only misses.
+
+These sections are evidence for learning, not automatic production behavior. Keep `active_adjustments` empty unless repeated matured evidence supports a narrow horizon/side/factor-scoped rule.
 
 Core principles:
 
@@ -159,7 +196,7 @@ Answer in Chinese with this structure:
 4. 长期质量与趋势
 5. 风险点
 6. 历史验证：高强度样本数、命中率、平均收益、窗口内回撤/上冲。只使用 `signal_score > 70` 或 `signal_score < -70` 的样本统计准确率。
-7. 复盘与自学习：说明本次应用的 `strategy_adjustments`、是否新增/更新 `references/review-memory.md`、下一步需要验证的候选规则。
+7. 复盘与自学习：说明本次应用的 `strategy_adjustments`、是否新增/更新 `references/review-memory.md`、是否命中研究复核层的弱势尾部/20-60日/量能连续性线索、下一步需要验证的候选规则。
 
 🛠️ 操作建议：
 分别说明短期是否适合试仓/等待，中期是否适合分批，长期是否适合纳入配置观察池。
