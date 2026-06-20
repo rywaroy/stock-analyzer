@@ -5487,6 +5487,158 @@ def stable_candidate_lines(simulations: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def wrong_directional_reduction_pct(item: dict[str, Any]) -> float | None:
+    baseline_wrong = number(item.get("baseline_wrong_directional_count"))
+    delta = number(item.get("wrong_directional_count_delta"))
+    if baseline_wrong is None or baseline_wrong <= 0 or delta is None:
+        return None
+    return max(0.0, -delta / baseline_wrong * 100)
+
+
+def candidate_promotion_audit_rows(
+    simulations: list[dict[str, Any]],
+    min_train_samples: int = 100,
+    min_validation_samples: int = 50,
+    min_neutralized_wrong_rate_pct: float = 60.0,
+    min_validation_baskets: int = 6,
+    min_rolling_folds: int = 3,
+    max_rolling_fold_sample_share_pct: float = 50.0,
+    min_positive_wrong_delta_fold_share_pct: float = 75.0,
+    min_validation_avg_basket_return_pct: float = 0.0,
+    max_validation_worst_basket_return_pct: float = -10.0,
+    include_empty: bool = False,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for simulation in simulations:
+        rule = simulation.get("rule") or {}
+        rule_id = str(rule.get("id") or "unknown")
+        train = simulation.get("train") or {}
+        validation = simulation.get("validation") or {}
+        basket = simulation.get("basket_validation") or {}
+        rolling = simulation.get("rolling_summary") or {}
+        blockers: list[str] = []
+        critical_blockers: list[str] = []
+
+        train_count = int(train.get("matched_count") or 0)
+        validation_count = int(validation.get("matched_count") or 0)
+        if not include_empty and train_count == 0 and validation_count == 0:
+            continue
+        if train_count < min_train_samples:
+            critical_blockers.append("训练样本不足")
+        if validation_count < min_validation_samples:
+            critical_blockers.append("验证样本不足")
+
+        mode = str(rule.get("score_adjustment_mode") or "")
+        if mode == "neutralize_to_watch":
+            train_wrong_rate = number(train.get("neutralized_wrong_directional_rate_pct"))
+            validation_wrong_rate = number(validation.get("neutralized_wrong_directional_rate_pct"))
+            train_delta = number(train.get("wrong_directional_count_delta"))
+            validation_delta = number(validation.get("wrong_directional_count_delta"))
+            if train_wrong_rate is None or train_wrong_rate < min_neutralized_wrong_rate_pct:
+                critical_blockers.append("训练降级错误率不足")
+            if validation_wrong_rate is None or validation_wrong_rate < min_neutralized_wrong_rate_pct:
+                critical_blockers.append("验证降级错误率不足")
+            if train_delta is None or train_delta >= 0:
+                critical_blockers.append("训练错误方向未减少")
+            if validation_delta is None or validation_delta >= 0:
+                critical_blockers.append("验证错误方向未减少")
+        else:
+            train_delta = number(train.get("hit_rate_delta_pct"))
+            validation_delta = number(validation.get("hit_rate_delta_pct"))
+            validation_return_delta = number(validation.get("directional_avg_return_delta_pct"))
+            validation_drawdown_delta = number(validation.get("directional_avg_drawdown_delta_pct"))
+            if train_delta is None or train_delta < 1.0:
+                critical_blockers.append("训练命中率改善不足")
+            if validation_delta is None or validation_delta < 0:
+                critical_blockers.append("验证命中率退化")
+            if validation_return_delta is not None and validation_return_delta < 0:
+                critical_blockers.append("验证收益退化")
+            if validation_drawdown_delta is not None and validation_drawdown_delta < 0:
+                critical_blockers.append("验证回撤退化")
+
+        basket_count = int(basket.get("basket_count") or 0)
+        if basket_count < min_validation_baskets:
+            blockers.append("验证日篮不足")
+        avg_basket_return = number(basket.get("avg_basket_return_pct"))
+        if avg_basket_return is None or avg_basket_return < min_validation_avg_basket_return_pct:
+            blockers.append("验证日篮收益不足")
+        worst_basket_return = number(basket.get("worst_basket_return_pct"))
+        if worst_basket_return is None or worst_basket_return < max_validation_worst_basket_return_pct:
+            blockers.append("最差日篮回撤过深")
+
+        rolling_folds = int(rolling.get("folds_with_samples") or 0)
+        max_share = number(rolling.get("max_fold_sample_share_pct"))
+        positive_fold_share = number(rolling.get("positive_wrong_delta_fold_share_pct"))
+        if rolling_folds < min_rolling_folds:
+            blockers.append("日期折叠不足")
+        if max_share is None or max_share > max_rolling_fold_sample_share_pct:
+            blockers.append("日期折叠样本集中")
+        if positive_fold_share is None or positive_fold_share < min_positive_wrong_delta_fold_share_pct:
+            blockers.append("日期折叠改善不稳定")
+
+        all_blockers = [*critical_blockers, *blockers]
+        if critical_blockers:
+            decision = "review_only"
+        elif blockers:
+            decision = "candidate_only"
+        else:
+            decision = "candidate_ready"
+        rows.append(
+            {
+                "rule_id": rule_id,
+                "decision": decision,
+                "blockers": all_blockers,
+                "train_matched_count": train_count,
+                "validation_matched_count": validation_count,
+                "train_wrong_directional_reduction_pct": wrong_directional_reduction_pct(train),
+                "validation_wrong_directional_reduction_pct": wrong_directional_reduction_pct(validation),
+                "validation_hit_rate_delta_pct": validation.get("hit_rate_delta_pct"),
+                "validation_basket_count": basket_count,
+                "validation_avg_basket_return_pct": avg_basket_return,
+                "validation_worst_basket_return_pct": worst_basket_return,
+                "rolling_folds_with_samples": rolling_folds,
+                "rolling_max_fold_sample_share_pct": max_share,
+                "rolling_positive_wrong_delta_fold_share_pct": positive_fold_share,
+            }
+        )
+    order = {"candidate_ready": 0, "candidate_only": 1, "review_only": 2}
+    return sorted(rows, key=lambda item: (order.get(str(item.get("decision")), 99), str(item.get("rule_id"))))
+
+
+def candidate_promotion_audit_lines(simulations: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "## 候选规则晋级审计",
+        "",
+        "- 这一节把训练/验证、日篮、日期折叠压缩成可复查的晋级结论；`候选可晋级` 仍只代表可进入候选/复核，不等于自动写入 active。",
+        "",
+        "| 规则 | 结论 | 训练样本 | 验证样本 | 验证错误方向减少率 | 验证日篮 | 日篮均收益 | 最差日篮 | 日期折叠 | 最大单期占比 | 阻塞原因 |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    rows = candidate_promotion_audit_rows(simulations)
+    if not rows:
+        return [
+            *lines,
+            "| 暂无有样本候选规则 | 暂无 | 0 | 0 | 暂无 | 0 | 暂无 | 暂无 | 0 | 暂无 | 暂无 |",
+        ]
+    decision_labels = {
+        "candidate_ready": "候选可晋级",
+        "candidate_only": "候选保留",
+        "review_only": "仅复核",
+    }
+    for row in rows:
+        blockers = "；".join(row.get("blockers") or []) or "无"
+        lines.append(
+            f"| `{row.get('rule_id')}` | {decision_labels.get(str(row.get('decision')), row.get('decision'))} | "
+            f"{row.get('train_matched_count', 0)} | {row.get('validation_matched_count', 0)} | "
+            f"{pct(row.get('validation_wrong_directional_reduction_pct'))} | "
+            f"{row.get('validation_basket_count', 0)} | {pct(row.get('validation_avg_basket_return_pct'))} | "
+            f"{pct(row.get('validation_worst_basket_return_pct'))} | "
+            f"{row.get('rolling_folds_with_samples', 0)} | "
+            f"{pct(row.get('rolling_max_fold_sample_share_pct'))} | {blockers} |"
+        )
+    return lines
+
+
 def rolling_stability_lines(simulations: list[dict[str, Any]]) -> list[str]:
     lines = [
         "## 候选规则滚动折叠稳定性",
@@ -5962,6 +6114,7 @@ def render_markdown_report(summary: dict[str, Any], metadata: dict[str, Any]) ->
     lines.extend(["", *stock_pool_generalization_lines(metadata)])
     lines.extend(["", *review_layer_failure_case_lines(metadata.get("outcomes") or [])])
     lines.extend(["", "## 稳定候选筛选", "", *stable_candidate_lines(metadata.get("simulations") or [])])
+    lines.extend(["", *candidate_promotion_audit_lines(metadata.get("simulations") or [])])
     lines.extend(["", *rolling_stability_lines(metadata.get("simulations") or [])])
     lines.extend(["", *stage_factor_stability_lines(metadata.get("simulations") or [])])
     errors = metadata.get("errors") or []

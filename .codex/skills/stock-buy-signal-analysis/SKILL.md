@@ -24,6 +24,37 @@ This skill is local to this project. Always work from the project root: `/Users/
 
 `stock.md` uses one `股票代码-股票名称` entry per line, for example `002466-天齐锂业`. When reading `stock.md`, parse each non-empty, non-comment line first: strip list markers and inline comments, split on the first `-`, normalize the left side to the six-digit stock code, and pass only that code into the analysis workflow.
 
+To add new stocks and immediately build historical evidence, use the add-and-backtest helper. It supports multiple stocks as separate args, commas, Chinese commas, or semicolons. Prefer `代码-名称` so `stock.md` stays readable; code-only input is also accepted.
+
+Preview without changing files or running network/database work:
+
+```bash
+uv run --python 3.12 --with-requirements requirements.txt \
+  python .codex/skills/stock-buy-signal-analysis/scripts/add_stocks_and_backtest.py \
+  "600519-贵州茅台" "300750-宁德时代" --dry-run
+```
+
+Add the stocks to `stock.md` and run historical backtest for only the input stocks:
+
+```bash
+uv run --python 3.12 --with-requirements requirements.txt \
+  python .codex/skills/stock-buy-signal-analysis/scripts/add_stocks_and_backtest.py \
+  "600519-贵州茅台" "300750-宁德时代" \
+  --from-date 2023-06-19 --to-date 2026-06-19 --validation-from 2024-06-19
+```
+
+When the stock pool changes materially and the goal is to refresh strategy evidence for the whole universe, run the same helper with `--backtest-scope all`; this updates `stock.md`, then uses the updated full file as the backtest pool.
+
+```bash
+uv run --python 3.12 --with-requirements requirements.txt \
+  python .codex/skills/stock-buy-signal-analysis/scripts/add_stocks_and_backtest.py \
+  "600519-贵州茅台" "300750-宁德时代" \
+  --backtest-scope all \
+  --from-date 2023-06-19 --to-date 2026-06-19 --validation-from 2024-06-19
+```
+
+If the new stocks should also be analyzed and persisted immediately, add `--run-daily`. The helper will run `save_daily_to_mysql.py` for the input stocks before the historical backtest. Use `--ingest-url` when the daily analysis should upload to production instead of writing local MySQL.
+
 ```bash
 uv run --python 3.12 --with-requirements requirements.txt \
   python save_daily_to_mysql.py --user root
@@ -154,12 +185,15 @@ Apply this review layer as follows:
 When improving or auditing this skill offline, use `research_signal_backtest.py` and inspect these report sections before promoting any rule:
 
 - `研究复核层新旧对照回放`: computable `review_layer_label/action/confidence` comparison against the raw signal.
+- `候选规则晋级审计`: compact train/validation, daily-basket, and date-fold promotion audit. Treat `候选可晋级` as evidence for candidate/review promotion, not automatic active scoring.
 - `历史基本面覆盖度与缺口`: whether the replay avoided future fundamentals and where long-term quality evidence is still missing.
 - `研究复核层组合级验证`: equal-weight daily baskets for buy candidates and downgrade-to-watch opportunity baskets.
 - `股票池扩展与泛化验证`: current `--codes-file`, pool size, and the next pool needed for generalization.
 - `研究复核层失败案例库`: false downgrades, missed sell-lag cases, and review-only misses.
 
-These sections are evidence for learning, not automatic production behavior. Keep `active_adjustments` empty unless repeated matured evidence supports a narrow horizon/side/factor-scoped rule.
+The latest 110-stock full audit report is `docs/research/stock-signal-backtest-2023-06-19-to-2026-06-19-validation-2024-06-19-promotion-audit.md`. It shows the raw global directional hit rate is still near 50%, while selected weak-tail and repair sell/avoid review candidates can reduce wrong directional sell/avoid samples sharply inside their scoped validation buckets. Use this as scoped evidence, not as a global accuracy claim.
+
+These sections are evidence for learning, not automatic production behavior. Keep `active_adjustments` empty unless repeated matured evidence supports a narrow horizon/side/factor-scoped rule across non-overlapping windows, basket validation, date folds, and failure-case review.
 
 Core principles:
 
@@ -215,6 +249,7 @@ Avoid guarantees, price targets without data, and investment-advice language. Sa
 ## Tools
 
 - Use `save_daily_to_mysql.py` as the default entrypoint. It performs analysis, schema/migration sync, MySQL upsert, historical accuracy refresh, and final report regeneration.
+- Use `.codex/skills/stock-buy-signal-analysis/scripts/add_stocks_and_backtest.py` when adding one or more stocks to `stock.md` and immediately generating historical backtest evidence. Default scope is only the input stocks; use `--backtest-scope all` to refresh evidence for the updated full pool.
 - The scorer reads `references/review-memory.md` automatically. Active memory adjustments affect horizon scores and are surfaced as `strategy_adjustments` in JSON output.
 - Use `scripts/analyze_stock.py` only when the user explicitly asks for no database writes, MySQL is unavailable, or you are debugging raw scoring output.
 - Use `stock_fundamental_analysis.py --json` directly only when debugging raw data.

@@ -5,6 +5,8 @@ export default defineConfig({
   description: '基于本地 MySQL 股票分析快照的 VitePress 数据展示',
   cleanUrls: true,
   lastUpdated: false,
+  // 生成型回测长报作为研究证据保留在仓库，不进入页面和本地搜索索引。
+  srcExclude: ['research/stock-signal-backtest-*.md'],
   themeConfig: {
     logo: '/logo.svg',
     nav: [

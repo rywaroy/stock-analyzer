@@ -29,6 +29,9 @@ from stock_fundamental_analysis import (
 
 
 SCORER_PATH = Path(__file__).resolve().parents[1] / ".codex/skills/stock-buy-signal-analysis/scripts/analyze_stock.py"
+ADD_STOCKS_PATH = (
+    Path(__file__).resolve().parents[1] / ".codex/skills/stock-buy-signal-analysis/scripts/add_stocks_and_backtest.py"
+)
 
 
 def make_ai_etf_result(index: int, trade_date: str = "2026-06-12") -> dict:
@@ -72,6 +75,15 @@ def load_signal_scorer():
     spec = importlib.util.spec_from_file_location("stock_buy_signal_scorer", SCORER_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"无法加载评分脚本：{SCORER_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_add_stocks_tool():
+    spec = importlib.util.spec_from_file_location("stock_add_stocks_tool", ADD_STOCKS_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载新增股票脚本：{ADD_STOCKS_PATH}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -134,6 +146,51 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertIn("repair_quality_sync", short_day_1["factors"])
         self.assertIn("horizon_stage_category", short_day_1["factors"])
         self.assertEqual(long_day_120, [])
+
+    def test_add_stocks_tool_appends_new_entries_and_skips_existing_codes(self):
+        tool = load_add_stocks_tool()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            stock_file = Path(tmp_dir) / "stock.md"
+            stock_file.write_text("000001-平安银行\n", encoding="utf-8")
+
+            entries = tool.parse_stock_entries(["000001-平安银行", "600519-贵州茅台,300750-宁德时代"])
+            result = tool.merge_stock_file(stock_file, entries)
+
+            self.assertEqual(result.added_codes, ["600519", "300750"])
+            self.assertEqual(result.skipped_codes, ["000001"])
+            self.assertEqual(
+                stock_file.read_text(encoding="utf-8").splitlines(),
+                ["000001-平安银行", "600519-贵州茅台", "300750-宁德时代"],
+            )
+
+    def test_add_stocks_tool_builds_multi_stock_backtest_plan_without_execution(self):
+        tool = load_add_stocks_tool()
+        args = tool.parse_args(
+            [
+                "600519-贵州茅台",
+                "300750-宁德时代",
+                "--from-date",
+                "2023-01-01",
+                "--to-date",
+                "2026-01-01",
+                "--validation-from",
+                "2024-01-01",
+                "--sample-step",
+                "5",
+                "--run-daily",
+                "--dry-run",
+            ]
+        )
+        entries = tool.parse_stock_entries(args.stocks)
+        plan = tool.build_execution_plan(args, entries, ["600519", "300750"])
+
+        self.assertEqual(plan.codes, ["600519", "300750"])
+        self.assertIn("save_daily_to_mysql.py", plan.daily_command)
+        self.assertIn("600519,300750", plan.daily_command)
+        self.assertIn("research_signal_backtest.py", plan.backtest_command)
+        self.assertIn("--from-date 2023-01-01", plan.backtest_command)
+        self.assertIn("--validation-from 2024-01-01", plan.backtest_command)
+        self.assertIn("--sample-step 5", plan.backtest_command)
 
     def test_research_backtest_extracts_factor_tags_from_visible_snapshot(self):
         result = {
@@ -3973,6 +4030,122 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         )
 
         self.assertEqual([item["rule"]["id"] for item in stable], ["neutralize-stable"])
+
+    def test_research_backtest_audits_candidate_promotion_evidence(self):
+        simulations = [
+            {
+                "rule": {"id": "ready", "score_adjustment_mode": "neutralize_to_watch"},
+                "train": {
+                    "matched_count": 500,
+                    "baseline_wrong_directional_count": 300,
+                    "neutralized_wrong_directional_rate_pct": 78.0,
+                    "wrong_directional_count_delta": -260,
+                },
+                "validation": {
+                    "matched_count": 180,
+                    "baseline_wrong_directional_count": 120,
+                    "neutralized_wrong_directional_rate_pct": 82.0,
+                    "wrong_directional_count_delta": -96,
+                },
+                "basket_validation": {
+                    "basket_count": 8,
+                    "avg_basket_return_pct": 4.5,
+                    "worst_basket_return_pct": -3.0,
+                },
+                "rolling_summary": {
+                    "folds_with_samples": 6,
+                    "max_fold_sample_share_pct": 32.0,
+                    "positive_wrong_delta_fold_share_pct": 100.0,
+                },
+            },
+            {
+                "rule": {"id": "date-clustered", "score_adjustment_mode": "neutralize_to_watch"},
+                "train": {
+                    "matched_count": 500,
+                    "baseline_wrong_directional_count": 300,
+                    "neutralized_wrong_directional_rate_pct": 78.0,
+                    "wrong_directional_count_delta": -260,
+                },
+                "validation": {
+                    "matched_count": 180,
+                    "baseline_wrong_directional_count": 120,
+                    "neutralized_wrong_directional_rate_pct": 82.0,
+                    "wrong_directional_count_delta": -96,
+                },
+                "basket_validation": {
+                    "basket_count": 8,
+                    "avg_basket_return_pct": 4.5,
+                    "worst_basket_return_pct": -3.0,
+                },
+                "rolling_summary": {
+                    "folds_with_samples": 2,
+                    "max_fold_sample_share_pct": 86.0,
+                    "positive_wrong_delta_fold_share_pct": 100.0,
+                },
+            },
+        ]
+
+        rows = research_backtest.candidate_promotion_audit_rows(simulations)
+
+        self.assertEqual(rows[0]["rule_id"], "ready")
+        self.assertEqual(rows[0]["decision"], "candidate_ready")
+        self.assertEqual(rows[0]["validation_wrong_directional_reduction_pct"], 80.0)
+        self.assertEqual(rows[0]["blockers"], [])
+        self.assertEqual(rows[1]["rule_id"], "date-clustered")
+        self.assertEqual(rows[1]["decision"], "candidate_only")
+        self.assertIn("日期折叠样本集中", rows[1]["blockers"])
+
+    def test_research_backtest_renders_candidate_promotion_audit(self):
+        simulations = [
+            {
+                "rule": {"id": "ready", "score_adjustment_mode": "neutralize_to_watch"},
+                "train": {
+                    "matched_count": 500,
+                    "baseline_wrong_directional_count": 300,
+                    "neutralized_wrong_directional_rate_pct": 78.0,
+                    "wrong_directional_count_delta": -260,
+                },
+                "validation": {
+                    "matched_count": 180,
+                    "baseline_wrong_directional_count": 120,
+                    "neutralized_wrong_directional_rate_pct": 82.0,
+                    "wrong_directional_count_delta": -96,
+                },
+                "basket_validation": {
+                    "basket_count": 8,
+                    "avg_basket_return_pct": 4.5,
+                    "worst_basket_return_pct": -3.0,
+                },
+                "rolling_summary": {
+                    "folds_with_samples": 6,
+                    "max_fold_sample_share_pct": 32.0,
+                    "positive_wrong_delta_fold_share_pct": 100.0,
+                },
+            }
+        ]
+
+        rendered = "\n".join(research_backtest.candidate_promotion_audit_lines(simulations))
+
+        self.assertIn("候选规则晋级审计", rendered)
+        self.assertIn("ready", rendered)
+        self.assertIn("候选可晋级", rendered)
+        self.assertIn("80.00%", rendered)
+
+    def test_research_backtest_candidate_promotion_audit_omits_empty_rules(self):
+        simulations = [
+            {
+                "rule": {"id": "empty", "score_adjustment_mode": "neutralize_to_watch"},
+                "train": {"matched_count": 0},
+                "validation": {"matched_count": 0},
+            }
+        ]
+
+        rows = research_backtest.candidate_promotion_audit_rows(simulations)
+        rendered = "\n".join(research_backtest.candidate_promotion_audit_lines(simulations))
+
+        self.assertEqual(rows, [])
+        self.assertIn("暂无有样本候选规则", rendered)
+        self.assertNotIn("empty", rendered)
 
     def test_research_backtest_summarizes_candidate_rule_rolling_folds(self):
         outcomes = [
