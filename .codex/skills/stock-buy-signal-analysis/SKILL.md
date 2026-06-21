@@ -57,25 +57,26 @@ If the new stocks should also be analyzed and persisted immediately, add `--run-
 
 ```bash
 uv run --python 3.12 --with-requirements requirements.txt \
-  python save_daily_to_mysql.py --user root
+  python save_daily_to_mysql.py --user root --skip-eastmoney
 ```
 
 ```bash
 uv run --python 3.12 --with-requirements requirements.txt \
-  python save_daily_to_mysql.py "002466" --user root
+  python save_daily_to_mysql.py "002466" --user root --skip-eastmoney
 ```
 
 For honest historical backfill, pass an as-of date or a date range. The scorer must only use data visible at that as-of date:
 
 ```bash
 uv run --python 3.12 --with-requirements requirements.txt \
-  python save_daily_to_mysql.py "002466" --user root --as-of-date 2026-03-15
+  python save_daily_to_mysql.py "002466" --user root --as-of-date 2026-03-15 --skip-eastmoney
 ```
 
 ```bash
 uv run --python 3.12 --with-requirements requirements.txt \
   python save_daily_to_mysql.py "002466" --user root \
-  --backfill-from 2026-03-15 --backfill-to 2026-03-20
+  --backfill-from 2026-03-15 --backfill-to 2026-03-20 \
+  --skip-eastmoney
 ```
 
 In historical mode, technical daily data is cut off at the as-of date. Do not use today's realtime spot/valuation snapshot or financial indicator endpoint to fill historical fundamentals; the workflow records those omissions in `source_errors_json` and lowers confidence instead.
@@ -85,7 +86,8 @@ For online reporting, post the analysis results to the production ingest endpoin
 ```bash
 uv run --python 3.12 --with-requirements requirements.txt \
   python save_daily_to_mysql.py \
-  --ingest-url "http://stock.zzh.cool/api/ingest/daily-analysis"
+  --ingest-url "http://stock.zzh.cool/api/ingest/daily-analysis" \
+  --skip-eastmoney
 ```
 
 When `--ingest-url` is provided, the local workflow still fetches AKShare data and scores the stocks, then uploads structured results to the online Express service. The online service is responsible for MySQL upsert, historical signal accuracy refresh, and final report regeneration.
@@ -97,10 +99,11 @@ Automation command:
 ```bash
 uv run --python 3.12 --with-requirements requirements.txt \
   python save_daily_to_mysql.py \
-  --ingest-url "http://stock.zzh.cool/api/ingest/daily-analysis"
+  --ingest-url "http://stock.zzh.cool/api/ingest/daily-analysis" \
+  --skip-eastmoney
 ```
 
-If Eastmoney `push2` is unavailable in the current network, first run the same command with `--preflight` to verify the environment and production service. For a production run that should bypass Eastmoney immediately and use fallback sources for available quote/name fields, add `--skip-eastmoney`. Keep source errors visible because fallback data does not replace PE/PB, market cap, share capital, industry, or listed date.
+Do not use Eastmoney `push2` in the default workflow. It has been unreliable in the current environment, so production and local daily runs should pass `--skip-eastmoney` and use the Sina realtime fallback for available quote/name fields. Keep source errors visible because Sina fallback data does not replace PE/PB, market cap, share capital, industry, or listed date. Use `--preflight` only to verify the environment and production service; it does not need to test Eastmoney availability.
 
 2. Build or update the AI recommended ETF after the stock analysis has been persisted.
 
