@@ -302,6 +302,11 @@
   font-weight: 700;
 }
 
+.conclusion-cell {
+  max-width: 200px;
+  color: var(--stock-text);
+}
+
 .stock-title-row {
   display: flex;
   justify-content: space-between;
@@ -708,6 +713,18 @@
   color: var(--stock-text);
   font-size: 16px;
   line-height: 1.6;
+}
+
+.detail-hero__copy {
+  min-width: 0;
+}
+
+.detail-hero__copy small {
+  display: block;
+  margin-top: 6px;
+  color: var(--stock-muted);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .horizon-grid {

@@ -84,6 +84,21 @@ function sampleResult() {
   };
 }
 
+function conflictingHorizonResult() {
+  return {
+    ...sampleResult(),
+    score: 58,
+    signal: '强买',
+    confidence: '高',
+    advice: '总分较高，但需要等待短期风险解除。',
+    horizon_scores: {
+      short_term: { label: '短期', score: -28, signal: '卖出偏向' },
+      medium_term: { label: '中期', score: 8, signal: '观望' },
+      long_term: { label: '长期', score: 62, signal: '强买' },
+    },
+  };
+}
+
 function sampleAiEtf() {
   return {
     portfolioName: 'AI_RECOMMENDED_ETF',
@@ -386,6 +401,35 @@ test('POST /api/ingest/daily-analysis persists results and refreshes reports in 
     pool.calls.some((call) => call.type === 'query' && call.params.some((param) => String(param).includes('## 历史验证'))),
     true,
   );
+});
+
+test('POST /api/ingest/daily-analysis builds report conclusion from horizon alignment', async () => {
+  const pool = createRecordingPool();
+  const app = createApp({ pool, ingestToken: 'secret', projectRootPath: '/tmp/no-static-dist' });
+
+  await withServer(app, async (server) => {
+    const response = await postJson(
+      server,
+      '/api/ingest/daily-analysis',
+      { adjustType: 'qfq', results: [conflictingHorizonResult()] },
+      { authorization: 'Bearer secret' },
+    );
+
+    assert.equal(response.status, 200);
+  });
+
+  const reportCall = pool.calls.find(
+    (call) => call.type === 'query' && call.sql.includes('INSERT INTO stock_daily_report'),
+  );
+  assert.ok(reportCall);
+  const reportText = reportCall.params[5];
+  const reportJson = JSON.parse(reportCall.params[7]);
+
+  assert.equal(reportJson.conclusion, '周期证据分歧，优先观察确认。');
+  assert.match(reportText, /周期证据分歧/);
+  assert.match(reportText, /短期卖出偏向/);
+  assert.match(reportText, /长期强买/);
+  assert.doesNotMatch(reportText, /强买入偏向，但仍应等待成交量和趋势继续确认。/);
 });
 
 test('POST /api/ingest/daily-analysis persists optional AI ETF payload', async () => {

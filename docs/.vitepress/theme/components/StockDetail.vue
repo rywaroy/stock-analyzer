@@ -29,6 +29,9 @@ const tradeDate = ref('');
 
 const detail = computed(() => payload.value?.detail || null);
 const reportHtml = computed(() => (detail.value?.report?.text ? md.render(detail.value.report.text) : ''));
+const primaryConclusion = computed(
+  () => detail.value?.conclusion || detail.value?.report?.json?.conclusion || detail.value?.advice || '暂无结构化结论',
+);
 const historyRows = computed(() => payload.value?.history || []);
 const trendWindows = computed(() => payload.value?.trendWindows || []);
 const accuracySummary = computed(() => payload.value?.accuracySummary || []);
@@ -164,7 +167,10 @@ onMounted(() => {
             <strong>{{ formatScore(detail.score) }}</strong>
             <SignalBadge :signal="detail.signalLabel" :score="detail.score" />
           </div>
-          <p>{{ detail.advice || '暂无操作建议' }}</p>
+          <div class="detail-hero__copy">
+            <p>{{ primaryConclusion }}</p>
+            <small>操作建议：{{ detail.advice || '暂无操作建议' }}</small>
+          </div>
         </section>
 
         <section class="metric-grid metric-grid--four">

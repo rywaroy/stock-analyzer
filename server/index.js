@@ -145,6 +145,7 @@ export function createApp({
       longTermSignalLabel: row.longTermSignalLabel,
       confidence: row.confidence,
       regime: row.regime,
+      conclusion: reportJson.conclusion || "",
       advice: row.advice || reportJson.advice || "",
       closePrice: toNumber(row.closePrice),
       turnoverRate: toNumber(row.turnoverRate),
@@ -184,6 +185,7 @@ export function createApp({
       longTermSignalLabel: row.longTermSignalLabel,
       confidence: row.confidence,
       regime: row.regime,
+      conclusion: reportJson.conclusion || "",
       advice: row.advice || reportJson.advice || "",
       horizonScores: parseJson(row.horizon_scores_json, {}),
       scoreParts: parseJson(row.score_parts_json, []),
@@ -368,6 +370,90 @@ export function createApp({
 
   function horizonValue(result, key, field) {
     return (result.horizon_scores?.[key] || {})[field];
+  }
+
+  function scoreSide(score) {
+    const numeric = toNumber(score);
+    if (numeric == null) return "unknown";
+    if (numeric >= 15) return "buy";
+    if (numeric <= -15) return "sell";
+    return "watch";
+  }
+
+  function fallbackScoreConclusion(result) {
+    if (result.score >= 50)
+      return "强买入偏向，但仍应等待成交量和趋势继续确认。";
+    if (result.score >= 15)
+      return "买入偏向存在，更适合分批观察或等待技术面进一步确认。";
+    if (result.score > -15)
+      return "观望。当前多空证据接近均衡，不适合给出明确买入或卖出信号。";
+    if (result.score > -50)
+      return "卖出或回避偏向，短期风险证据强于机会证据。";
+    return "强回避偏向，风险信号较集中。";
+  }
+
+  function horizonSignalPhrase(result, key, fallbackLabel) {
+    const horizon = result.horizon_scores?.[key] || {};
+    return `${horizon.label || fallbackLabel}${horizon.signal || "暂无"}`;
+  }
+
+  function reportConclusion(result) {
+    const horizonKeys = [
+      ["short_term", "短期"],
+      ["medium_term", "中期"],
+      ["long_term", "长期"],
+    ];
+    const hasAllHorizons = horizonKeys.every(
+      ([key]) => result.horizon_scores?.[key],
+    );
+    if (!hasAllHorizons) {
+      const conclusion = fallbackScoreConclusion(result);
+      return { conclusion, conclusionDetail: conclusion };
+    }
+
+    const sides = Object.fromEntries(
+      horizonKeys.map(([key]) => [key, scoreSide(horizonValue(result, key, "score"))]),
+    );
+    const detail = horizonKeys
+      .map(([key, label]) => horizonSignalPhrase(result, key, label))
+      .join("；");
+    const strategyAdjustments = result.strategy_adjustments || [];
+    const sourceErrors = result.source_errors || [];
+
+    let base;
+    if (horizonKeys.every(([key]) => sides[key] === "buy")) {
+      base = "三周期一致偏多，买入偏向质量较高。";
+    } else if (horizonKeys.every(([key]) => sides[key] === "sell")) {
+      base = "三周期一致偏空，优先回避或降低风险暴露。";
+    } else if (horizonKeys.every(([key]) => sides[key] === "watch")) {
+      base = "三周期均偏观察，等待趋势或基本面给出更清晰证据。";
+    } else if (sides.medium_term === "buy" && sides.long_term === "buy") {
+      base =
+        sides.short_term === "sell"
+          ? "中长期偏多但短期风险未解除，优先等待短期修复确认。"
+          : "中长期偏多，适合分批观察并等待短期择时确认。";
+    } else if (
+      sides.short_term === "buy" &&
+      sides.medium_term !== "buy" &&
+      sides.long_term !== "buy"
+    ) {
+      base = "短期偏多但中长期支撑不足，只适合交易性观察。";
+    } else if (new Set(Object.values(sides)).size > 1) {
+      base = "周期证据分歧，优先观察确认。";
+    } else {
+      base = fallbackScoreConclusion(result);
+    }
+
+    if (result.confidence === "低" || sourceErrors.length) {
+      base = "数据置信度不足，优先观察复核。";
+    } else if (strategyAdjustments.length) {
+      base = `${base.replace(/。$/, "")}，且已应用复盘校准。`;
+    }
+
+    return {
+      conclusion: base,
+      conclusionDetail: `${base}（${detail}；总分 ${result.score}/100，${result.signal}）`,
+    };
   }
 
   async function upsert(
@@ -837,15 +923,7 @@ ORDER BY stock_code, horizon, window_days
     const sourceErrors = result.source_errors || [];
     const tradeDate = technical.trade_date || "未知交易日";
     const displayName = [code, name].filter(Boolean).join(" ");
-    let conclusion =
-      "观望。当前多空证据接近均衡，不适合给出明确买入或卖出信号。";
-    if (result.score >= 50)
-      conclusion = "强买入偏向，但仍应等待成交量和趋势继续确认。";
-    else if (result.score >= 15)
-      conclusion = "买入偏向存在，更适合分批观察或等待技术面进一步确认。";
-    else if (result.score <= -50) conclusion = "强回避偏向，风险信号较集中。";
-    else if (result.score <= -15)
-      conclusion = "卖出或回避偏向，短期风险证据强于机会证据。";
+    const { conclusion, conclusionDetail } = reportConclusion(result);
 
     const rsi = technical.rsi || {};
     const macd = technical.macd || {};
@@ -879,7 +957,7 @@ ORDER BY stock_code, horizon, window_days
       "",
       "## 结论",
       "",
-      conclusion,
+      conclusionDetail,
       "",
       "## 核心数据",
       "",
@@ -916,6 +994,7 @@ ORDER BY stock_code, horizon, window_days
       score: result.score,
       signal: result.signal,
       confidence: result.confidence,
+      conclusion,
       regime: result.regime,
       advice: result.advice,
       horizon_scores: result.horizon_scores || {},

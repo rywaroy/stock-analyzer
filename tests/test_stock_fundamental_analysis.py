@@ -5080,6 +5080,43 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertEqual(report_json["horizon_scores"]["long_term"]["score"], 18)
         self.assertEqual(report_json["strategy_adjustments"][0]["id"], "macd-kdj-overheat-short-term")
 
+    def test_generate_final_report_conclusion_uses_horizon_alignment_before_total_score(self):
+        result = {
+            "code": "002466",
+            "name": "",
+            "score": 58,
+            "signal": "强买",
+            "confidence": "高",
+            "regime": "mixed",
+            "advice": "总分较高，但需要等待短期风险解除。",
+            "horizon_scores": {
+                "short_term": {"label": "短期", "score": -28, "signal": "卖出偏向"},
+                "medium_term": {"label": "中期", "score": 8, "signal": "观望"},
+                "long_term": {"label": "长期", "score": 62, "signal": "强买"},
+            },
+            "strategy_adjustments": [],
+            "parts": [],
+            "source_errors": [],
+            "raw": {
+                "code": "002466",
+                "name": "",
+                "report_date": "2026-03-31",
+                "technical": {"trade_date": "2026-06-12", "latest_close": 62.5},
+                "technical_trend": {"rating": "技术趋势震荡", "score": 1, "conclusion": "趋势震荡。"},
+                "metrics": [{"label": "ROE", "value": 12.0}],
+                "strengths": [],
+                "risks": [],
+            },
+        }
+
+        _, report_text, report_json = mysql_sink.generate_final_report(result)
+
+        self.assertIn("周期证据分歧", report_text)
+        self.assertIn("短期卖出偏向", report_text)
+        self.assertIn("长期强买", report_text)
+        self.assertNotIn("强买入偏向，但仍应等待成交量和趋势继续确认。", report_text)
+        self.assertEqual(report_json["conclusion"], "周期证据分歧，优先观察确认。")
+
     def test_buy_signal_scorer_returns_three_horizon_scores(self):
         scorer = load_signal_scorer()
         result = scorer.score_item(

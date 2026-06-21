@@ -33,6 +33,7 @@ const columns = [
   { title: '中期', key: 'mediumTerm', width: 112, sorter: (a: any, b: any) => Number(a.mediumTermScore) - Number(b.mediumTermScore) },
   { title: '长期', key: 'longTerm', width: 112, sorter: (a: any, b: any) => Number(a.longTermScore) - Number(b.longTermScore) },
   { title: '置信度', dataIndex: 'confidence', key: 'confidence', width: 92 },
+  { title: '结论', key: 'conclusion', width: 220, ellipsis: true },
   { title: '收盘 / 换手', key: 'quote', width: 150 },
   { title: '成交额', key: 'amount', width: 120 },
   { title: '趋势', key: 'trend', ellipsis: true },
@@ -273,6 +274,12 @@ onBeforeUnmount(() => {
                   <a-tag :color="scoreTone(record.longTermScore)">{{ formatScore(record.longTermScore) }}</a-tag>
                   <span>{{ record.longTermSignalLabel || '暂无' }}</span>
                 </div>
+              </template>
+
+              <template v-else-if="column.key === 'conclusion'">
+                <a-typography-text class="conclusion-cell" :ellipsis="{ tooltip: record.conclusion || '暂无结论' }">
+                  {{ record.conclusion || '暂无结论' }}
+                </a-typography-text>
               </template>
 
               <template v-else-if="column.key === 'quote'">

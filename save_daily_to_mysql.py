@@ -162,6 +162,74 @@ def horizon_summary_lines(result: dict[str, Any]) -> list[str]:
     return lines
 
 
+def score_side(score: Any) -> str:
+    numeric = number(score)
+    if numeric is None:
+        return "unknown"
+    if numeric >= 15:
+        return "buy"
+    if numeric <= -15:
+        return "sell"
+    return "watch"
+
+
+def horizon_signal_phrase(result: dict[str, Any], key: str, fallback_label: str) -> str:
+    horizon = horizon_scores(result).get(key) or {}
+    label = str(horizon.get("label") or fallback_label)
+    signal = str(horizon.get("signal") or "暂无")
+    return f"{label}{signal}"
+
+
+def fallback_score_conclusion(result: dict[str, Any]) -> str:
+    if result["score"] >= 50:
+        return "强买入偏向，但仍应等待成交量和趋势继续确认。"
+    if result["score"] >= 15:
+        return "买入偏向存在，更适合分批观察或等待技术面进一步确认。"
+    if result["score"] > -15:
+        return "观望。当前多空证据接近均衡，不适合给出明确买入或卖出信号。"
+    if result["score"] > -50:
+        return "卖出或回避偏向，短期风险证据强于机会证据。"
+    return "强回避偏向，风险信号较集中。"
+
+
+def report_conclusion(result: dict[str, Any]) -> tuple[str, str]:
+    horizons = horizon_scores(result)
+    if not all(key in horizons for key, _ in HORIZON_KEYS):
+        conclusion = fallback_score_conclusion(result)
+        return conclusion, conclusion
+
+    sides = {key: score_side(horizon_value(result, key, "score")) for key, _ in HORIZON_KEYS}
+    detail = "；".join(horizon_signal_phrase(result, key, label) for key, label in HORIZON_KEYS)
+    strategy_adjustments = result.get("strategy_adjustments") or []
+    confidence = result.get("confidence")
+    source_errors = result.get("source_errors") or []
+
+    if all(side == "buy" for side in sides.values()):
+        base = "三周期一致偏多，买入偏向质量较高。"
+    elif all(side == "sell" for side in sides.values()):
+        base = "三周期一致偏空，优先回避或降低风险暴露。"
+    elif all(side == "watch" for side in sides.values()):
+        base = "三周期均偏观察，等待趋势或基本面给出更清晰证据。"
+    elif sides["medium_term"] == "buy" and sides["long_term"] == "buy":
+        if sides["short_term"] == "sell":
+            base = "中长期偏多但短期风险未解除，优先等待短期修复确认。"
+        else:
+            base = "中长期偏多，适合分批观察并等待短期择时确认。"
+    elif sides["short_term"] == "buy" and sides["medium_term"] != "buy" and sides["long_term"] != "buy":
+        base = "短期偏多但中长期支撑不足，只适合交易性观察。"
+    elif len(set(sides.values())) > 1:
+        base = "周期证据分歧，优先观察确认。"
+    else:
+        base = fallback_score_conclusion(result)
+
+    if confidence == "低" or source_errors:
+        base = "数据置信度不足，优先观察复核。"
+    elif strategy_adjustments:
+        base = f"{base.rstrip('。')}，且已应用复盘校准。"
+
+    return base, f"{base}（{detail}；总分 {result['score']}/100，{result['signal']}）"
+
+
 def evaluation_summary_lines(result: dict[str, Any]) -> list[str]:
     if "evaluation_summary" not in result:
         return []
@@ -180,16 +248,7 @@ def generate_final_report(result: dict[str, Any]) -> tuple[str, str, dict[str, A
 
     display_name = f"{code} {name}".strip()
     title = f"{display_name} {trade_date} 最终分析报告"
-    if result["score"] >= 50:
-        conclusion = "强买入偏向，但仍应等待成交量和趋势继续确认。"
-    elif result["score"] >= 15:
-        conclusion = "买入偏向存在，更适合分批观察或等待技术面进一步确认。"
-    elif result["score"] > -15:
-        conclusion = "观望。当前多空证据接近均衡，不适合给出明确买入或卖出信号。"
-    elif result["score"] > -50:
-        conclusion = "卖出或回避偏向，短期风险证据强于机会证据。"
-    else:
-        conclusion = "强回避偏向，风险信号较集中。"
+    conclusion, conclusion_detail = report_conclusion(result)
 
     rsi = technical.get("rsi") or {}
     macd = technical.get("macd") or {}
@@ -211,7 +270,7 @@ def generate_final_report(result: dict[str, Any]) -> tuple[str, str, dict[str, A
         "",
         "## 结论",
         "",
-        conclusion,
+        conclusion_detail,
         "",
         "## 核心数据",
         "",
@@ -257,6 +316,7 @@ def generate_final_report(result: dict[str, Any]) -> tuple[str, str, dict[str, A
         "score": result["score"],
         "signal": result["signal"],
         "confidence": result["confidence"],
+        "conclusion": conclusion,
         "regime": result["regime"],
         "advice": result["advice"],
         "horizon_scores": horizon_scores(result),
