@@ -5543,6 +5543,23 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertEqual(portfolio["holdings"][0]["stockCode"], "000000")
         self.assertIn("首次", portfolio["selectionRule"])
 
+    def test_build_ai_etf_portfolio_excludes_star_market_stocks(self):
+        results = [make_ai_etf_result(index) for index in range(10)]
+        star_market_result = make_ai_etf_result(99)
+        star_market_result["code"] = "688001"
+        star_market_result["name"] = "科创测试"
+        star_market_result["score"] = 100
+        star_market_result["raw"]["code"] = "688001"
+        star_market_result["raw"]["name"] = "科创测试"
+        for horizon in star_market_result["horizon_scores"].values():
+            horizon["score"] = 100
+        results.append(star_market_result)
+
+        portfolio = mysql_sink.build_ai_etf_portfolio(results, "qfq")
+
+        self.assertEqual(len(portfolio["holdings"]), 10)
+        self.assertNotIn("688001", {holding["stockCode"] for holding in portfolio["holdings"]})
+
     def test_build_ai_etf_portfolio_marks_rebalance_actions_from_previous_holdings(self):
         results = [make_ai_etf_result(index) for index in range(12)]
         previous_holdings = [

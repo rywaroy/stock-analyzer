@@ -137,6 +137,10 @@ AI_ETF_INITIAL_NOTIONAL = 1_000_000.0
 AI_ETF_TARGET_COUNT = 10
 
 
+def is_star_market_stock(code: Any) -> bool:
+    return str(code or "").startswith("688")
+
+
 def value_from_mapping(row: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         if key in row:
@@ -422,6 +426,7 @@ def build_ai_etf_portfolio(
         if result_trade_date(result)
         and result_close_price(result) is not None
         and str(result.get("code") or "")
+        and not is_star_market_stock(result.get("code"))
     ]
     if len(candidates) < AI_ETF_TARGET_COUNT:
         return None
