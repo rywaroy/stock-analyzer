@@ -13,6 +13,27 @@ const projectRoot = path.resolve(__dirname, "..");
 export const DEFAULT_INGEST_API_TOKEN =
   "stock-analysis-ingest-2026-6f8c2d91b7a443e0";
 
+const AI_ETF_PORTFOLIO_NAME = "AI_RECOMMENDED_ETF";
+const AI_ETF_INITIAL_NOTIONAL = 1_000_000;
+const AI_ETF_TARGET_COUNT = 10;
+const AI_ETF_WEIGHT_CHANGE_THRESHOLD = 0.5;
+const AI_ETF_MIN_HOLD_DAYS = 20;
+const AI_ETF_SELL_MEDIUM_THRESHOLD = -15;
+const AI_ETF_SELL_LONG_THRESHOLD = -15;
+const AI_ETF_ENTRY_MEDIUM_THRESHOLD = 25;
+const AI_ETF_ENTRY_LONG_THRESHOLD = 20;
+const HORIZON_STABILITY_MAX_DELTA = {
+  medium_term: 18,
+  long_term: 12,
+};
+const TOTAL_SCORE_STABILITY_MAX_DELTA = 25;
+const HISTORICAL_SCORE_LOOKBACK_ROWS = 20;
+const HISTORY_SCORE_HORIZONS = [
+  ["overall", "总分", "score", []],
+  ["medium_term", "中期", "medium_term_score", [20, 60, 120]],
+  ["long_term", "长期", "long_term_score", [60, 120, 250]],
+];
+
 let pool;
 
 export function createDefaultPool() {
@@ -301,6 +322,616 @@ export function createApp({
     };
   }
 
+  function resultTradeDate(result) {
+    return String(result?.raw?.technical?.trade_date || "");
+  }
+
+  function groupResultsByTradeDate(results = []) {
+    const grouped = {};
+    for (const result of results) {
+      const tradeDate = resultTradeDate(result);
+      if (!tradeDate) continue;
+      grouped[tradeDate] ||= [];
+      grouped[tradeDate].push(result);
+    }
+    return grouped;
+  }
+
+  function resultClosePrice(result) {
+    return numberOrNull(result?.raw?.technical?.latest_close);
+  }
+
+  function isStarMarketStock(code) {
+    return String(code || "").startsWith("688");
+  }
+
+  function aiEtfRankScore(result) {
+    let penalty = 0;
+    if (result.confidence === "低") penalty += 15;
+    const sourceErrors = result.source_errors || [];
+    if (sourceErrors.length) penalty += Math.min(20, sourceErrors.length * 5);
+    return (
+      horizonScore(result, "short_term") * 0.2 +
+      horizonScore(result, "medium_term") * 0.35 +
+      horizonScore(result, "long_term") * 0.35 +
+      (numberOrNull(result.score) || 0) * 0.1 -
+      penalty
+    );
+  }
+
+  function aiEtfValidCandidate(result) {
+    return Boolean(
+      resultTradeDate(result) &&
+        resultClosePrice(result) != null &&
+        result.code &&
+        !isStarMarketStock(result.code) &&
+        result.confidence !== "低" &&
+        !(result.source_errors || []).length &&
+        horizonScore(result, "medium_term") > 0 &&
+        horizonScore(result, "long_term") > 0,
+    );
+  }
+
+  function aiEtfEntryCandidate(result) {
+    return (
+      aiEtfValidCandidate(result) &&
+      horizonScore(result, "medium_term") >= AI_ETF_ENTRY_MEDIUM_THRESHOLD &&
+      horizonScore(result, "long_term") >= AI_ETF_ENTRY_LONG_THRESHOLD
+    );
+  }
+
+  function parseDate(value) {
+    if (!value) return null;
+    const date = new Date(`${String(value).slice(0, 10)}T00:00:00Z`);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  function previousHoldingDays(previous, tradeDate) {
+    const firstHeld = parseDate(previous.first_held_date || previous.firstHeldDate || previous.trade_date || previous.tradeDate);
+    const current = parseDate(tradeDate);
+    if (!firstHeld || !current) return null;
+    return Math.max(0, Math.round((current - firstHeld) / 86400000));
+  }
+
+  function previousFirstHeldDate(previous, tradeDate) {
+    return String(previous.first_held_date || previous.firstHeldDate || previous.trade_date || previous.tradeDate || tradeDate);
+  }
+
+  function aiEtfShouldSell(result, previous, tradeDate) {
+    if (!result) return { sell: true, reason: "本期分析结果缺失，无法继续验证持仓逻辑。" };
+    const mediumScore = horizonScore(result, "medium_term");
+    const longScore = horizonScore(result, "long_term");
+    const sourceErrors = result.source_errors || [];
+    const severeBreak = mediumScore <= -30 || longScore <= -30;
+    if (sourceErrors.length) return { sell: true, reason: "关键数据源异常，组合不继续承担无法验证的持仓风险。" };
+    if (result.confidence === "低") return { sell: true, reason: "评分置信度降为低，退出组合等待重新观察。" };
+    if (mediumScore <= AI_ETF_SELL_MEDIUM_THRESHOLD) {
+      return { sell: true, reason: `中期评分降至 ${mediumScore.toFixed(0)}，触发组合卖出纪律。` };
+    }
+    if (longScore <= AI_ETF_SELL_LONG_THRESHOLD) {
+      return { sell: true, reason: `长期评分降至 ${longScore.toFixed(0)}，触发组合卖出纪律。` };
+    }
+    const heldDays = previousHoldingDays(previous, tradeDate);
+    if (heldDays != null && heldDays < AI_ETF_MIN_HOLD_DAYS && !severeBreak) {
+      return { sell: false, reason: `持仓仅 ${heldDays} 天，未触发硬性风控，维持最小持有期纪律。` };
+    }
+    if (!aiEtfValidCandidate(result)) {
+      return { sell: true, reason: "中长期质量不再满足组合观察池要求。" };
+    }
+    return { sell: false, reason: "继续保留，仍符合中长期持仓纪律。" };
+  }
+
+  function roundWeight(value) {
+    return Math.round(value * 10000) / 10000;
+  }
+
+  function clampWeight(value, lower = 5, upper = 15) {
+    return Math.max(lower, Math.min(upper, value));
+  }
+
+  function boundedNormalizeWeights(rawWeights, lower = 5, upper = 15) {
+    const entries = Object.entries(rawWeights);
+    if (!entries.length) return {};
+    const weights = Object.fromEntries(entries.map(([code, value]) => [code, clampWeight(value, lower, upper)]));
+    for (let index = 0; index < 20; index += 1) {
+      const total = Object.values(weights).reduce((sum, value) => sum + value, 0);
+      const diff = 100 - total;
+      if (Math.abs(diff) < 0.0001) break;
+      const adjustable = Object.keys(weights).filter((code) => (diff > 0 ? weights[code] < upper : weights[code] > lower));
+      if (!adjustable.length) break;
+      const step = diff / adjustable.length;
+      for (const code of adjustable) {
+        weights[code] = clampWeight(weights[code] + step, lower, upper);
+      }
+    }
+    const rounded = Object.fromEntries(Object.entries(weights).map(([code, value]) => [code, roundWeight(value)]));
+    const residual = roundWeight(100 - Object.values(rounded).reduce((sum, value) => sum + value, 0));
+    if (residual) {
+      const target = Object.keys(rounded).sort((left, right) => {
+        const leftRoom = residual > 0 ? upper - rounded[left] : rounded[left] - lower;
+        const rightRoom = residual > 0 ? upper - rounded[right] : rounded[right] - lower;
+        return rightRoom - leftRoom;
+      })[0];
+      rounded[target] = roundWeight(rounded[target] + residual);
+    }
+    return rounded;
+  }
+
+  function previousHoldingByCode(previousHoldings = []) {
+    const grouped = {};
+    for (const row of previousHoldings) {
+      const code = String(row.stock_code || row.stockCode || "");
+      if (code) grouped[code] = row;
+    }
+    return grouped;
+  }
+
+  function normalizedAction(previousWeight, targetWeight) {
+    const delta = roundWeight(targetWeight - previousWeight);
+    if (previousWeight <= 0 && targetWeight > 0) return "buy";
+    if (previousWeight > 0 && targetWeight <= 0) return "sell";
+    if (delta > AI_ETF_WEIGHT_CHANGE_THRESHOLD) return "increase";
+    if (delta < -AI_ETF_WEIGHT_CHANGE_THRESHOLD) return "reduce";
+    return "hold";
+  }
+
+  function actionReason(action, result = null, detail = null) {
+    if (detail) return detail;
+    if (action === "buy") return "新纳入组合，已经通过观察池质量筛选。";
+    if (action === "sell") return "持仓质量不再满足组合纪律，按调仓参考价模拟卖出。";
+    if (action === "increase") return "继续保留且目标权重随中长期胜率和组合约束小幅提高。";
+    if (action === "reduce") return "继续保留但目标权重随中长期胜率和风险约束小幅下调。";
+    if (result) return "继续保留，评分和风险状态仍满足组合纪律。";
+    return "本期无仓位变化。";
+  }
+
+  function holdingRationale(result, action) {
+    const name = result.name || result.raw?.name || result.code;
+    return `${actionReason(action, result)} ${name} 综合分 ${result.score}，短期 ${horizonScore(result, "short_term")}，中期 ${horizonScore(result, "medium_term")}，长期 ${horizonScore(result, "long_term")}。`;
+  }
+
+  function selectAiEtfHoldings(candidates, previousByCode, tradeDate) {
+    const resultByCode = Object.fromEntries(candidates.map((result) => [String(result.code), result]));
+    const retained = [];
+    const sellReasons = {};
+    for (const [code, previous] of Object.entries(previousByCode)) {
+      const previousWeight = numberOrNull(previous.target_weight_pct ?? previous.targetWeightPct) || 0;
+      if (previousWeight <= 0) continue;
+      const decision = aiEtfShouldSell(resultByCode[code], previous, tradeDate);
+      if (decision.sell) {
+        sellReasons[code] = decision.reason;
+      } else if (resultByCode[code]) {
+        retained.push(resultByCode[code]);
+      }
+    }
+    retained.sort((left, right) => aiEtfRankScore(right) - aiEtfRankScore(left));
+    const selected = retained.slice(0, AI_ETF_TARGET_COUNT);
+    const selectedCodes = new Set(selected.map((result) => String(result.code)));
+    const entryCandidates = candidates
+      .filter((result) => !selectedCodes.has(String(result.code)) && aiEtfEntryCandidate(result))
+      .sort((left, right) => aiEtfRankScore(right) - aiEtfRankScore(left));
+    const fallbackCandidates = candidates
+      .filter((result) => !selectedCodes.has(String(result.code)) && aiEtfValidCandidate(result))
+      .sort((left, right) => aiEtfRankScore(right) - aiEtfRankScore(left));
+    const fillPool = [...entryCandidates];
+    if (selected.length + fillPool.length < AI_ETF_TARGET_COUNT) {
+      const known = new Set(fillPool.map((result) => String(result.code)));
+      fillPool.push(...fallbackCandidates.filter((result) => !known.has(String(result.code))));
+    }
+    return { selected: [...selected, ...fillPool].slice(0, AI_ETF_TARGET_COUNT), sellReasons };
+  }
+
+  function targetWeightsForSelection(selected, previousByCode) {
+    if (!selected.length) return {};
+    if (!Object.keys(previousByCode).length) {
+      return Object.fromEntries(selected.map((result) => [String(result.code), roundWeight(100 / selected.length)]));
+    }
+    const rankScores = selected.map(aiEtfRankScore);
+    const averageRank = rankScores.reduce((sum, value) => sum + value, 0) / rankScores.length;
+    const rawWeights = {};
+    selected.forEach((result, index) => {
+      const code = String(result.code);
+      const desired = clampWeight(10 + (rankScores[index] - averageRank) * 0.08);
+      const previousWeight = numberOrNull(previousByCode[code]?.target_weight_pct ?? previousByCode[code]?.targetWeightPct);
+      rawWeights[code] = previousWeight ? previousWeight * 0.7 + desired * 0.3 : desired;
+    });
+    return boundedNormalizeWeights(rawWeights);
+  }
+
+  function buildAiEtfPortfolio(results, adjustType, previousHoldings = []) {
+    const candidates = results.filter(
+      (result) =>
+        resultTradeDate(result) &&
+        resultClosePrice(result) != null &&
+        result.code &&
+        !isStarMarketStock(result.code),
+    );
+    if (!candidates.length) return null;
+    const previousByCode = previousHoldingByCode(previousHoldings);
+    const tradeDate = candidates.map(resultTradeDate).sort().at(-1);
+    const { selected, sellReasons } = selectAiEtfHoldings(candidates, previousByCode, tradeDate);
+    if (selected.length < AI_ETF_TARGET_COUNT) return null;
+
+    const targetWeights = targetWeightsForSelection(selected, previousByCode);
+    const holdings = [];
+    const rebalance = [];
+    let totalUnrealized = 0;
+    let totalRealized = 0;
+    let turnover = 0;
+
+    for (const result of selected) {
+      const code = String(result.code);
+      const item = result.raw || {};
+      const previous = previousByCode[code] || {};
+      const previousWeight = numberOrNull(previous.target_weight_pct ?? previous.targetWeightPct) || 0;
+      const targetWeight = targetWeights[code];
+      const referencePrice = resultClosePrice(result);
+      let simulatedNotional = (AI_ETF_INITIAL_NOTIONAL * targetWeight) / 100;
+      let simulatedQuantity = referencePrice ? simulatedNotional / referencePrice : null;
+      const previousPrice = numberOrNull(previous.reference_price ?? previous.referencePrice);
+      const previousQuantity = numberOrNull(previous.simulated_quantity ?? previous.simulatedQuantity) || 0;
+      const unrealized =
+        referencePrice != null && previousPrice != null && previousQuantity
+          ? (referencePrice - previousPrice) * previousQuantity
+          : 0;
+      totalUnrealized += unrealized;
+      const delta = roundWeight(targetWeight - previousWeight);
+      const action = normalizedAction(previousWeight, targetWeight);
+      turnover += Math.abs(delta);
+      if (action === "hold" && previousQuantity) {
+        simulatedQuantity = previousQuantity;
+        simulatedNotional = referencePrice ? simulatedQuantity * referencePrice : simulatedNotional;
+      }
+      const actionDetail = previousByCode[code] ? "继续保留，已经通过观察期和中长期质量筛选。" : null;
+      const holding = {
+        portfolioName: AI_ETF_PORTFOLIO_NAME,
+        tradeDate,
+        adjustType,
+        stockCode: code,
+        stockName: result.name || item.name || "",
+        industry: item.industry || "",
+        previousWeightPct: roundWeight(previousWeight),
+        targetWeightPct: targetWeight,
+        weightDeltaPct: delta,
+        action,
+        referencePrice,
+        simulatedQuantity,
+        simulatedNotional,
+        score: intOrNull(result.score),
+        signalLabel: result.signal,
+        shortTermScore: intOrNull(result.horizon_scores?.short_term?.score),
+        shortTermSignalLabel: result.horizon_scores?.short_term?.signal,
+        mediumTermScore: intOrNull(result.horizon_scores?.medium_term?.score),
+        mediumTermSignalLabel: result.horizon_scores?.medium_term?.signal,
+        longTermScore: intOrNull(result.horizon_scores?.long_term?.score),
+        longTermSignalLabel: result.horizon_scores?.long_term?.signal,
+        confidence: result.confidence,
+        rationale: actionDetail ? `${actionDetail} ${holdingRationale(result, action)}` : holdingRationale(result, action),
+        risks: item.risks || [],
+        rankScore: Math.round(aiEtfRankScore(result) * 10000) / 10000,
+        firstHeldDate: previous ? previousFirstHeldDate(previous, tradeDate) : tradeDate,
+        holdingDays: previous ? previousHoldingDays(previous, tradeDate) : 0,
+      };
+      holdings.push(holding);
+      rebalance.push({
+        portfolioName: AI_ETF_PORTFOLIO_NAME,
+        tradeDate,
+        adjustType,
+        stockCode: code,
+        stockName: holding.stockName,
+        action,
+        previousWeightPct: holding.previousWeightPct,
+        targetWeightPct: holding.targetWeightPct,
+        weightDeltaPct: holding.weightDeltaPct,
+        referencePrice,
+        simulatedQuantityDelta:
+          action === "buy"
+            ? simulatedQuantity
+            : ["increase", "reduce"].includes(action)
+              ? (simulatedQuantity || 0) - previousQuantity
+              : 0,
+        simulatedNotionalDelta: (AI_ETF_INITIAL_NOTIONAL * delta) / 100,
+        realizedPnl: 0,
+        realizedReturnPct: 0,
+        reason: actionReason(action, result, actionDetail),
+      });
+    }
+
+    const selectedCodes = new Set(holdings.map((holding) => holding.stockCode));
+    const resultByCode = Object.fromEntries(candidates.map((result) => [String(result.code), result]));
+    for (const [code, previous] of Object.entries(previousByCode)) {
+      if (selectedCodes.has(code)) continue;
+      const previousWeight = numberOrNull(previous.target_weight_pct ?? previous.targetWeightPct) || 0;
+      if (previousWeight <= 0) continue;
+      const previousPrice = numberOrNull(previous.reference_price ?? previous.referencePrice);
+      const previousQuantity = numberOrNull(previous.simulated_quantity ?? previous.simulatedQuantity) || 0;
+      const currentResult = resultByCode[code];
+      const referencePrice = currentResult ? resultClosePrice(currentResult) : previousPrice;
+      const realizedPnl =
+        referencePrice != null && previousPrice != null && previousQuantity
+          ? (referencePrice - previousPrice) * previousQuantity
+          : 0;
+      totalRealized += realizedPnl;
+      turnover += previousWeight;
+      const stockName = String(previous.stock_name || previous.stockName || "");
+      const sellReason = sellReasons[code] || actionReason("sell");
+      holdings.push({
+        portfolioName: AI_ETF_PORTFOLIO_NAME,
+        tradeDate,
+        adjustType,
+        stockCode: code,
+        stockName,
+        industry: previous.industry || "",
+        previousWeightPct: roundWeight(previousWeight),
+        targetWeightPct: 0,
+        weightDeltaPct: roundWeight(-previousWeight),
+        action: "sell",
+        referencePrice,
+        simulatedQuantity: 0,
+        simulatedNotional: 0,
+        score: null,
+        signalLabel: null,
+        shortTermScore: null,
+        shortTermSignalLabel: null,
+        mediumTermScore: null,
+        mediumTermSignalLabel: null,
+        longTermScore: null,
+        longTermSignalLabel: null,
+        confidence: null,
+        rationale: sellReason,
+        risks: [],
+        rankScore: null,
+      });
+      rebalance.push({
+        portfolioName: AI_ETF_PORTFOLIO_NAME,
+        tradeDate,
+        adjustType,
+        stockCode: code,
+        stockName,
+        action: "sell",
+        previousWeightPct: roundWeight(previousWeight),
+        targetWeightPct: 0,
+        weightDeltaPct: roundWeight(-previousWeight),
+        referencePrice,
+        simulatedQuantityDelta: -previousQuantity,
+        simulatedNotionalDelta: -(AI_ETF_INITIAL_NOTIONAL * previousWeight) / 100,
+        realizedPnl,
+        realizedReturnPct:
+          referencePrice != null && previousPrice != null && previousPrice !== 0
+            ? (referencePrice / previousPrice - 1) * 100
+            : 0,
+        reason: sellReason,
+      });
+    }
+
+    const totalPnl = totalRealized + totalUnrealized;
+    const hasPrevious = Boolean(Object.keys(previousByCode).length);
+    return {
+      portfolioName: AI_ETF_PORTFOLIO_NAME,
+      tradeDate,
+      adjustType,
+      selectionRule: hasPrevious
+        ? "基金经理式低换手组合：保留仍合格持仓，最小持有期约束，只有中长期恶化/低置信/数据异常才卖出；新增股票需通过观察池质量筛选。"
+        : "首次建仓：从观察池中选择中期、长期均为正且数据置信度合格的10只股票，等权配置。",
+      nav: AI_ETF_INITIAL_NOTIONAL + totalPnl,
+      dailyReturnPct: 0,
+      cumulativeReturnPct: (totalPnl / AI_ETF_INITIAL_NOTIONAL) * 100,
+      realizedPnl: totalRealized,
+      unrealizedPnl: totalUnrealized,
+      totalPnl,
+      turnoverPct: Math.min(200, roundWeight(turnover)),
+      holdingCount: holdings.filter((holding) => holding.targetWeightPct > 0).length,
+      holdings,
+      rebalance,
+      summary: {
+        candidateCount: candidates.length,
+        selectedCount: AI_ETF_TARGET_COUNT,
+        hasPreviousPortfolio: hasPrevious,
+        retainedCount: holdings.filter((holding) => holding.targetWeightPct > 0 && previousByCode[holding.stockCode]).length,
+        soldCount: holdings.filter((holding) => holding.action === "sell").length,
+        minHoldDays: AI_ETF_MIN_HOLD_DAYS,
+        entryRule: {
+          mediumTermScoreAtLeast: AI_ETF_ENTRY_MEDIUM_THRESHOLD,
+          longTermScoreAtLeast: AI_ETF_ENTRY_LONG_THRESHOLD,
+          confidence: "非低",
+          sourceErrors: "无关键数据异常",
+        },
+        sellRule: {
+          mediumTermScoreAtOrBelow: AI_ETF_SELL_MEDIUM_THRESHOLD,
+          longTermScoreAtOrBelow: AI_ETF_SELL_LONG_THRESHOLD,
+          confidence: "低",
+          sourceErrors: "任一关键异常",
+        },
+      },
+    };
+  }
+
+  function previousScoreByCode(previousScores = []) {
+    const grouped = {};
+    for (const row of previousScores) {
+      const code = String(row.stock_code || row.stockCode || "");
+      if (code) grouped[code] = row;
+    }
+    return grouped;
+  }
+
+  function addStabilityPart(result, horizon, previousDayScore, rawScore, adjustedScore) {
+    const horizonInfo = result.horizon_scores?.[horizon];
+    if (!horizonInfo) return;
+    const label = String(horizonInfo.label || horizon);
+    horizonInfo.parts ||= [];
+    horizonInfo.parts.push({
+      module: `${label}稳定器`,
+      points: adjustedScore - rawScore,
+      reason: `参考上一交易日 ${previousDayScore}/100，限制中长期分数单日跳变。`,
+    });
+  }
+
+  function applyScoreStability(results, previousScores = []) {
+    const previousByCode = previousScoreByCode(previousScores);
+    if (!Object.keys(previousByCode).length) return results;
+    for (const result of results) {
+      const previous = previousByCode[String(result.code || "")];
+      if (!previous) continue;
+      const applied = [];
+      for (const [horizon, maxDelta] of Object.entries(HORIZON_STABILITY_MAX_DELTA)) {
+        const horizonInfo = result.horizon_scores?.[horizon];
+        if (!horizonInfo || stabilityBreakDetected(result, horizon)) continue;
+        const previousScore = intOrNull(previous[`${horizon}_score`] ?? previous[`${horizon}Score`]);
+        const currentScore = intOrNull(horizonInfo.score);
+        const adjustedScore = dampScoreChange(previousScore, currentScore, maxDelta);
+        if (previousScore == null || currentScore == null || adjustedScore == null || adjustedScore === currentScore) {
+          continue;
+        }
+        horizonInfo.score = adjustedScore;
+        horizonInfo.signal = signalLabelFromScore(adjustedScore);
+        horizonInfo.advice = horizonAdvice(horizon, adjustedScore, result.regime);
+        addStabilityPart(result, horizon, previousScore, currentScore, adjustedScore);
+        applied.push({
+          horizon,
+          previousScore,
+          rawScore: currentScore,
+          stabilizedScore: adjustedScore,
+          maxDelta,
+        });
+      }
+      const previousTotal = previous.score;
+      const currentTotal = intOrNull(result.score);
+      const adjustedTotal = dampScoreChange(previousTotal, currentTotal, TOTAL_SCORE_STABILITY_MAX_DELTA);
+      if (currentTotal != null && adjustedTotal != null && adjustedTotal !== currentTotal) {
+        result.score = adjustedTotal;
+        result.signal = signalLabelFromScore(adjustedTotal);
+        applied.push({
+          horizon: "overall",
+          previousScore: intOrNull(previousTotal),
+          rawScore: currentTotal,
+          stabilizedScore: adjustedTotal,
+          maxDelta: TOTAL_SCORE_STABILITY_MAX_DELTA,
+        });
+      }
+      if (applied.length) {
+        result.stability_adjustments ||= [];
+        result.stability_adjustments.push(...applied);
+      }
+    }
+    return results;
+  }
+
+  async function fetchLatestSignalScoresBefore(connection, tradeDate, adjustType) {
+    if (!tradeDate) return [];
+    const [rows] = await connection.query(
+      `
+      SELECT
+        stock_code,
+        score,
+        short_term_score,
+        medium_term_score,
+        long_term_score
+      FROM stock_daily_signal_score
+      WHERE adjust_type = ?
+        AND trade_date = (
+          SELECT MAX(trade_date)
+          FROM stock_daily_signal_score
+          WHERE adjust_type = ?
+            AND trade_date < ?
+        )
+      ORDER BY stock_code
+      `,
+      [adjustType, adjustType, tradeDate],
+    );
+    return rows;
+  }
+
+  async function fetchHistoricalSignalScoresBefore(
+    connection,
+    stockCodes,
+    tradeDate,
+    adjustType,
+    limit = HISTORICAL_SCORE_LOOKBACK_ROWS,
+  ) {
+    const uniqueCodes = [...new Set((stockCodes || []).map(String).filter(Boolean))];
+    if (!uniqueCodes.length || !tradeDate) return {};
+    const [rows] = await connection.query(
+      `
+      SELECT
+        stock_code,
+        DATE_FORMAT(trade_date, '%Y-%m-%d') AS trade_date,
+        score,
+        short_term_score,
+        medium_term_score,
+        long_term_score,
+        horizon_scores_json,
+        score_parts_json,
+        raw_analysis_json
+      FROM (
+        SELECT
+          stock_code,
+          trade_date,
+          score,
+          short_term_score,
+          medium_term_score,
+          long_term_score,
+          horizon_scores_json,
+          score_parts_json,
+          raw_analysis_json,
+          ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY trade_date DESC) AS row_rank
+        FROM stock_daily_signal_score
+        WHERE adjust_type = ?
+          AND trade_date < ?
+          AND stock_code IN (?)
+      ) ranked_scores
+      WHERE row_rank <= ?
+      ORDER BY stock_code, trade_date
+      `,
+      [adjustType, tradeDate, uniqueCodes, limit],
+    );
+    const grouped = {};
+    for (const row of rows) {
+      const code = String(row.stock_code || "");
+      if (!code) continue;
+      grouped[code] ||= [];
+      grouped[code].push(row);
+    }
+    return grouped;
+  }
+
+  async function fetchLatestAiEtfHoldingsBefore(connection, tradeDate, adjustType) {
+    if (!tradeDate) return [];
+    const [rows] = await connection.query(
+      `
+      SELECT
+        stock_code,
+        stock_name,
+        industry,
+        target_weight_pct,
+        reference_price,
+        simulated_quantity,
+        simulated_notional,
+        raw_json
+      FROM stock_ai_etf_holding
+      WHERE portfolio_name = ?
+        AND adjust_type = ?
+        AND trade_date = (
+          SELECT MAX(trade_date)
+          FROM stock_ai_etf_holding
+          WHERE portfolio_name = ?
+            AND adjust_type = ?
+            AND trade_date < ?
+        )
+        AND target_weight_pct > 0
+      ORDER BY stock_code
+      `,
+      [AI_ETF_PORTFOLIO_NAME, adjustType, AI_ETF_PORTFOLIO_NAME, adjustType, tradeDate],
+    );
+    return rows.map((row) => {
+      const raw = parseJson(row.raw_json, {});
+      return {
+        ...row,
+        first_held_date: raw.firstHeldDate || raw.tradeDate || row.tradeDate,
+      };
+    });
+  }
+
   async function loadDateSummaries() {
     const [rows] = await pool.query(`
     SELECT
@@ -353,6 +984,317 @@ export function createApp({
     return value == null ? null : JSON.stringify(value);
   }
 
+  function signalLabelFromScore(score) {
+    const numeric = intOrNull(score);
+    if (numeric == null) return "观望";
+    if (numeric >= 50) return "强买";
+    if (numeric >= 15) return "买入偏向";
+    if (numeric > -15) return "观望";
+    if (numeric > -50) return "卖出偏向";
+    return "强卖/回避";
+  }
+
+  function formatSignedNumber(value, digits = 0) {
+    const numeric = numberOrNull(value);
+    if (numeric == null) return "暂无";
+    return `${numeric > 0 ? "+" : ""}${numeric.toFixed(digits)}`;
+  }
+
+  function scoreChangeWord(delta) {
+    const numeric = numberOrNull(delta);
+    if (numeric == null) return "变化";
+    if (numeric > 0) return "升高";
+    if (numeric < 0) return "下降";
+    return "持平";
+  }
+
+  function resultScoreForHorizon(result, horizon) {
+    return horizon === "overall" ? intOrNull(result.score) : intOrNull(horizonValue(result, horizon, "score"));
+  }
+
+  function tradeDateFromRow(row) {
+    return String(row.trade_date || row.tradeDate || "").slice(0, 10);
+  }
+
+  function rawAnalysisFromRow(row) {
+    return parseJson(row.raw_analysis_json ?? row.rawAnalysisJson ?? row.raw_analysis ?? row.raw, {});
+  }
+
+  function horizonScoresFromRow(row) {
+    return parseJson(row.horizon_scores_json ?? row.horizonScoresJson ?? row.horizon_scores ?? row.horizonScores, {});
+  }
+
+  function trendReturnFromRaw(raw, days) {
+    for (const window of raw?.technical_trend?.windows || []) {
+      if (Number(window.days) === days) {
+        return numberOrNull(window.return_pct);
+      }
+    }
+    return null;
+  }
+
+  function scorePartsByModule(horizonInfo = {}) {
+    const modules = {};
+    for (const part of horizonInfo.parts || []) {
+      const module = String(part.module || "").trim();
+      const points = numberOrNull(part.points);
+      if (!module || points == null) continue;
+      modules[module] = (modules[module] || 0) + points;
+    }
+    return modules;
+  }
+
+  function topScoreParts(horizonInfo = {}, limit = 3) {
+    return (horizonInfo.parts || [])
+      .map((part) => ({
+        module: String(part.module || "").trim(),
+        points: numberOrNull(part.points),
+        reason: String(part.reason || ""),
+      }))
+      .filter((part) => part.module && part.points != null)
+      .sort((left, right) => Math.abs(right.points) - Math.abs(left.points))
+      .slice(0, limit)
+      .map((part) => ({
+        ...part,
+        points: Number(part.points.toFixed(2)),
+      }));
+  }
+
+  function formatKeyParts(parts = []) {
+    if (!parts.length) return "暂无";
+    return parts.map((part) => `${part.module} ${formatSignedNumber(part.points, 2)} 分`).join("；");
+  }
+
+  function buildPartComparisons(previousHorizon = {}, currentHorizon = {}, limit = 3) {
+    const previousParts = scorePartsByModule(previousHorizon);
+    const currentParts = scorePartsByModule(currentHorizon);
+    const modules = new Set([...Object.keys(previousParts), ...Object.keys(currentParts)]);
+    return [...modules]
+      .map((module) => {
+        const previousPoints = previousParts[module] || 0;
+        const currentPoints = currentParts[module] || 0;
+        const deltaPoints = currentPoints - previousPoints;
+        return {
+          module,
+          previousPoints: Number(previousPoints.toFixed(2)),
+          currentPoints: Number(currentPoints.toFixed(2)),
+          deltaPoints: Number(deltaPoints.toFixed(2)),
+        };
+      })
+      .filter((item) => Math.abs(item.deltaPoints) >= 2)
+      .sort((left, right) => Math.abs(right.deltaPoints) - Math.abs(left.deltaPoints))
+      .slice(0, limit);
+  }
+
+  function buildTrendComparisons(result, previousRow, daysList) {
+    const currentRaw = result.raw || {};
+    const previousRaw = rawAnalysisFromRow(previousRow);
+    const comparisons = [];
+    for (const days of daysList) {
+      const previousReturn = trendReturnFromRaw(previousRaw, days);
+      const currentReturn = trendReturnFromRaw(currentRaw, days);
+      if (previousReturn == null || currentReturn == null) continue;
+      comparisons.push({
+        days,
+        previousReturnPct: Number(previousReturn.toFixed(2)),
+        currentReturnPct: Number(currentReturn.toFixed(2)),
+        deltaPct: Number((currentReturn - previousReturn).toFixed(2)),
+      });
+    }
+    return comparisons;
+  }
+
+  function matchingStabilityAdjustment(result, horizon) {
+    return (result.stability_adjustments || []).find((adjustment) => String(adjustment.horizon || "") === horizon) || null;
+  }
+
+  function buildHistoryExplanations(label, scoreSummary, trendComparisons, partComparisons, stabilityAdjustment) {
+    const explanations = [];
+    const delta = numberOrNull(scoreSummary.deltaFromPrevious);
+    if (delta != null && Math.abs(delta) >= 10) {
+      explanations.push(`${label}较上一期${scoreChangeWord(delta)} ${Math.abs(delta).toFixed(0)} 分，需要结合历史证据复核。`);
+    }
+    let trendExplanationCount = 0;
+    for (const comparison of trendComparisons) {
+      const trendDelta = numberOrNull(comparison.deltaPct);
+      if (trendDelta == null || Math.abs(trendDelta) < 3) continue;
+      const direction = trendDelta > 0 ? "改善" : "走弱";
+      explanations.push(
+        `近 ${comparison.days} 日收益从 ${formatPercent(comparison.previousReturnPct)} 变为 ${formatPercent(comparison.currentReturnPct)}，${direction} ${Math.abs(trendDelta).toFixed(2)} 个百分点。`,
+      );
+      trendExplanationCount += 1;
+      if (trendExplanationCount >= 2) break;
+    }
+    if (stabilityAdjustment) {
+      explanations.push(
+        `稳定器参考上一期 ${stabilityAdjustment.previousScore}/100，将原始 ${stabilityAdjustment.rawScore}/100 调整为 ${stabilityAdjustment.stabilizedScore}/100。`,
+      );
+    }
+    for (const comparison of partComparisons) {
+      explanations.push(
+        `评分项「${comparison.module}」从 ${formatSignedNumber(comparison.previousPoints, 2)} 分变为 ${formatSignedNumber(comparison.currentPoints, 2)} 分，变化 ${formatSignedNumber(comparison.deltaPoints, 2)} 分。`,
+      );
+    }
+    if (!explanations.length) {
+      explanations.push(`${label}历史分数和核心证据变化有限，当前判断主要延续上一期。`);
+    }
+    return explanations.slice(0, 4);
+  }
+
+  function buildHistoricalScoreContext(result, historicalRows = []) {
+    const rows = historicalRows
+      .filter((row) => tradeDateFromRow(row))
+      .sort((left, right) => tradeDateFromRow(left).localeCompare(tradeDateFromRow(right)));
+    if (!rows.length) return {};
+    const previousRow = rows.at(-1);
+    const previousHorizons = horizonScoresFromRow(previousRow);
+    const horizons = {};
+    for (const [horizon, label, field, daysList] of HISTORY_SCORE_HORIZONS) {
+      const values = rows.map((row) => intOrNull(row[field])).filter((value) => value != null);
+      const currentScore = resultScoreForHorizon(result, horizon);
+      const previousScore = intOrNull(previousRow[field]);
+      if (currentScore == null || previousScore == null) continue;
+      const recentAverage = values.length ? Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(1)) : null;
+      const scoreSummary = {
+        label,
+        currentScore,
+        previousScore,
+        deltaFromPrevious: currentScore - previousScore,
+        recentAverage,
+        recentMin: values.length ? Math.min(...values) : null,
+        recentMax: values.length ? Math.max(...values) : null,
+        deltaFromAverage: recentAverage == null ? null : Number((currentScore - recentAverage).toFixed(1)),
+        currentSignal: signalLabelFromScore(currentScore),
+        previousSignal: signalLabelFromScore(previousScore),
+      };
+      if (horizon !== "overall") {
+        const currentHorizon = result.horizon_scores?.[horizon] || {};
+        const previousHorizon = previousHorizons[horizon] || {};
+        const trendComparisons = buildTrendComparisons(result, previousRow, daysList);
+        const partComparisons = buildPartComparisons(previousHorizon, currentHorizon);
+        scoreSummary.trendComparisons = trendComparisons;
+        scoreSummary.partComparisons = partComparisons;
+        scoreSummary.previousKeyParts = topScoreParts(previousHorizon);
+        scoreSummary.currentKeyParts = topScoreParts(currentHorizon);
+        scoreSummary.explanations = buildHistoryExplanations(
+          label,
+          scoreSummary,
+          trendComparisons,
+          partComparisons,
+          matchingStabilityAdjustment(result, horizon),
+        );
+      }
+      horizons[horizon] = scoreSummary;
+    }
+    return {
+      lookbackCount: rows.length,
+      previousTradeDate: tradeDateFromRow(previousRow),
+      horizons,
+    };
+  }
+
+  function applyHistoricalScoreContext(results, historicalScoresByCode = {}) {
+    for (const result of results) {
+      const context = buildHistoricalScoreContext(result, historicalScoresByCode[String(result.code || "")] || []);
+      if (Object.keys(context).length) {
+        result.historical_score_context = context;
+      }
+    }
+    return results;
+  }
+
+  function historicalScoreContextLines(context = {}) {
+    const horizons = context.horizons || {};
+    if (!Object.keys(horizons).length) return [];
+    const lookback = context.lookbackCount;
+    const lines = [`- 对比窗口：最近 ${lookback} 次历史评分；上一期：${context.previousTradeDate || "暂无"}。`];
+    for (const key of ["overall", "medium_term", "long_term"]) {
+      const item = horizons[key];
+      if (!item) continue;
+      const delta = numberOrNull(item.deltaFromPrevious);
+      const deltaPhrase = delta == null ? "暂无" : `${scoreChangeWord(delta)} ${Math.abs(delta).toFixed(0)} 分`;
+      lines.push(
+        `- ${item.label || key}：当前 ${item.currentScore}/100；上一期 ${item.previousScore}/100（${deltaPhrase}）；近 ${lookback} 次均值 ${formatDecimal(item.recentAverage, 1)}，区间 ${item.recentMin}~${item.recentMax}。`,
+      );
+      if (key === "medium_term" || key === "long_term") {
+        lines.push(
+          `- ${item.label || key}评分项：上一期 ${formatKeyParts(item.previousKeyParts || [])}；本期 ${formatKeyParts(item.currentKeyParts || [])}。`,
+        );
+        for (const explanation of item.explanations || []) {
+          lines.push(`- ${item.label || key}依据：${explanation}`);
+        }
+      }
+    }
+    return lines;
+  }
+
+  function scoreSide(score) {
+    const numeric = numberOrNull(score);
+    if (numeric == null) return "unknown";
+    if (numeric >= 15) return "buy";
+    if (numeric <= -15) return "sell";
+    return "watch";
+  }
+
+  function horizonAdvice(horizon, score, regime = "mixed") {
+    if (horizon === "short_term") {
+      if (score >= 50) return "短期动能和环境配合，可考虑顺势但需要严格止损。";
+      if (score >= 15) return "短期有买入偏向，更适合小仓位试探或等待放量确认。";
+      if (score > -15) return "短期信号不够一致，等待突破、回踩或动能修复。";
+      return "短期风险偏高，先回避追涨或降低仓位。";
+    }
+    if (horizon === "medium_term") {
+      if (score >= 50) return "中期趋势和质量配合，适合分批配置并跟踪关键均线。";
+      if (score >= 15) return "中期偏正向，可分批跟踪，等待趋势继续确认。";
+      if (score > -15) return "中期证据混合，观察 20/60/120 日趋势是否重新同向。";
+      return "中期偏弱，除非重新站回关键均线并改善量价结构。";
+    }
+    if (score >= 50) return "长期质量和趋势较强，适合纳入长期观察或分批配置池。";
+    if (score >= 15) return "长期有正向基础，但仍要结合估值、安全边际和仓位管理。";
+    if (score > -15) return "长期吸引力不足，等待基本面或长期趋势给出更清晰证据。";
+    if (regime === "downtrend") return "长期趋势偏弱，优先等待长期结构修复。";
+    return "长期风险收益不占优，暂不适合提高配置权重。";
+  }
+
+  function horizonScore(result, key) {
+    return numberOrNull(result?.horizon_scores?.[key]?.score) ?? 0;
+  }
+
+  function trendWindowReturn(result, days) {
+    for (const window of result?.raw?.technical_trend?.windows || []) {
+      if (Number(window.days) === days) {
+        return numberOrNull(window.return_pct);
+      }
+    }
+    return null;
+  }
+
+  function dampScoreChange(previousScore, currentScore, maxDelta) {
+    const previous = intOrNull(previousScore);
+    const current = intOrNull(currentScore);
+    if (previous == null || current == null) return current;
+    const delta = current - previous;
+    if (Math.abs(delta) <= maxDelta) return current;
+    return previous + (delta > 0 ? maxDelta : -maxDelta);
+  }
+
+  function stabilityBreakDetected(result, horizon) {
+    if (result.confidence === "低" || (result.source_errors || []).length > 0) {
+      return true;
+    }
+    if (horizon === "medium_term") {
+      const r20 = trendWindowReturn(result, 20);
+      const r60 = trendWindowReturn(result, 60);
+      return (r20 != null && r20 <= -10) || (r60 != null && r60 <= -15) || horizonScore(result, "short_term") <= -50;
+    }
+    if (horizon === "long_term") {
+      const r60 = trendWindowReturn(result, 60);
+      const r120 = trendWindowReturn(result, 120);
+      return (r60 != null && r60 <= -18) || (r120 != null && r120 <= -25);
+    }
+    return false;
+  }
+
   function metricValues(item) {
     const values = {};
     for (const metric of item.metrics || []) {
@@ -370,14 +1312,6 @@ export function createApp({
 
   function horizonValue(result, key, field) {
     return (result.horizon_scores?.[key] || {})[field];
-  }
-
-  function scoreSide(score) {
-    const numeric = toNumber(score);
-    if (numeric == null) return "unknown";
-    if (numeric >= 15) return "buy";
-    if (numeric <= -15) return "sell";
-    return "watch";
   }
 
   function fallbackScoreConclusion(result) {
@@ -930,6 +1864,9 @@ ORDER BY stock_code, horizon, window_days
     const boll = technical.boll || {};
     const strengths = item.strengths || ["暂无明确优势"];
     const risks = item.risks || ["暂无明确风险"];
+    const stabilityAdjustments = result.stability_adjustments || [];
+    const historicalContext = result.historical_score_context || {};
+    const historicalLines = historicalScoreContextLines(historicalContext);
     const horizonLines = [
       ["short_term", "短期"],
       ["medium_term", "中期"],
@@ -981,13 +1918,24 @@ ORDER BY stock_code, horizon, window_days
       "## 历史验证",
       "",
       ...formatEvaluationLines(result.evaluation_summary),
-      "",
-      "## 操作建议",
-      "",
-      result.advice,
     ];
+    if (historicalLines.length) {
+      lines.push("", "## 历史分数对照", "", ...historicalLines);
+    }
+    lines.push("", "## 操作建议", "", result.advice);
     if (sourceErrors.length) {
       lines.push("", "## 数据提醒", "", ...sourceErrors.map(String));
+    }
+    if (stabilityAdjustments.length) {
+      lines.push(
+        "",
+        "## 评分稳定性",
+        "",
+        ...stabilityAdjustments.map(
+          (adjustment) =>
+            `- ${adjustment.horizon}：上一期 ${adjustment.previousScore}，原始 ${adjustment.rawScore}，稳定后 ${adjustment.stabilizedScore}。`,
+        ),
+      );
     }
     const reportText = `${lines.join("\n").trimEnd()}\n`;
     const reportJson = {
@@ -1001,8 +1949,12 @@ ORDER BY stock_code, horizon, window_days
       strengths,
       risks,
       source_errors: sourceErrors,
+      stability_adjustments: stabilityAdjustments,
       evaluation_summary: result.evaluation_summary || emptyEvaluationSummary(),
     };
+    if (Object.keys(historicalContext).length) {
+      reportJson.historical_score_context = historicalContext;
+    }
     return {
       title: `${displayName} ${tradeDate} 最终分析报告`,
       text: reportText,
@@ -1178,7 +2130,75 @@ ORDER BY stock_code, horizon, window_days
     };
   }
 
-  async function persistIngestResults(connection, results, adjustType, aiEtf = null) {
+  async function fetchLatestSignalTradeDate(connection, adjustType) {
+    const [rows] = await connection.query(
+      `
+      SELECT DATE_FORMAT(MAX(trade_date), '%Y-%m-%d') AS tradeDate
+      FROM stock_daily_signal_score
+      WHERE adjust_type = ?
+      `,
+      [adjustType],
+    );
+    return rows[0]?.tradeDate || null;
+  }
+
+  async function fetchAiEtfCandidateResults(connection, adjustType, tradeDate = null) {
+    const effectiveTradeDate = tradeDate || (await fetchLatestSignalTradeDate(connection, adjustType));
+    if (!effectiveTradeDate) return [];
+    const [rows] = await connection.query(
+      `
+      SELECT
+        stock_code AS code,
+        score,
+        signal_label AS signal,
+        confidence,
+        regime,
+        advice,
+        horizon_scores_json,
+        score_parts_json,
+        source_errors_json,
+        raw_analysis_json
+      FROM stock_daily_signal_score
+      WHERE adjust_type = ?
+        AND trade_date = ?
+      ORDER BY stock_code
+      `,
+      [adjustType, effectiveTradeDate],
+    );
+    return rows.map((row) => {
+      const raw = parseJson(row.raw_analysis_json, {});
+      return {
+        code: String(row.code),
+        name: raw.name || "",
+        score: intOrNull(row.score),
+        signal: row.signal,
+        confidence: row.confidence,
+        regime: row.regime,
+        advice: row.advice,
+        horizon_scores: parseJson(row.horizon_scores_json, {}),
+        parts: parseJson(row.score_parts_json, []),
+        source_errors: parseJson(row.source_errors_json, []),
+        raw,
+      };
+    });
+  }
+
+  async function persistIngestResults(connection, results, adjustType, aiEtf = null, buildAiEtf = false) {
+    const incomingTradeDates = results.map(resultTradeDate).filter(Boolean).sort();
+    const latestIncomingTradeDate = incomingTradeDates.at(-1) || null;
+    if (results.length) {
+      for (const [tradeDate, dateResults] of Object.entries(groupResultsByTradeDate(results))) {
+        const previousScores = await fetchLatestSignalScoresBefore(connection, tradeDate, adjustType);
+        applyScoreStability(dateResults, previousScores);
+        const historicalScores = await fetchHistoricalSignalScoresBefore(
+          connection,
+          dateResults.map((result) => result.code),
+          tradeDate,
+          adjustType,
+        );
+        applyHistoricalScoreContext(dateResults, historicalScores);
+      }
+    }
     const persistedCodes = [];
     for (const result of results) {
       const item = result.raw || {};
@@ -1200,29 +2220,41 @@ ORDER BY stock_code, horizon, window_days
       await persistScore(connection, result, adjustType);
       await persistSignalOutcomes(connection, result, adjustType);
     }
-    await upsert(
-      connection,
-      "stock_data_ingest_run",
-      {
-        run_finished_at: new Date(),
-        status: "success",
-        stock_codes_json: jsonValue(persistedCodes),
-        message: `已通过接口写入 ${persistedCodes.length} 只股票的每日分析数据`,
-      },
-      ["run_finished_at", "status", "stock_codes_json", "message"],
-    );
-    await refreshSignalOutcomes(connection);
-    const summaries = await fetchEvaluationSummariesForResults(
-      connection,
-      results,
-      adjustType,
-    );
-    for (const result of results) {
-      result.evaluation_summary =
-        summaries[String(result.code)] || emptyEvaluationSummary();
-      await persistReport(connection, result, adjustType);
+    if (results.length) {
+      await upsert(
+        connection,
+        "stock_data_ingest_run",
+        {
+          run_finished_at: new Date(),
+          status: "success",
+          stock_codes_json: jsonValue(persistedCodes),
+          message: `已通过接口写入 ${persistedCodes.length} 只股票的每日分析数据`,
+        },
+        ["run_finished_at", "status", "stock_codes_json", "message"],
+      );
+      await refreshSignalOutcomes(connection);
+      const summaries = await fetchEvaluationSummariesForResults(
+        connection,
+        results,
+        adjustType,
+      );
+      for (const result of results) {
+        result.evaluation_summary =
+          summaries[String(result.code)] || emptyEvaluationSummary();
+        await persistReport(connection, result, adjustType);
+      }
     }
-    return persistAiEtf(connection, aiEtf, adjustType);
+    if (aiEtf) {
+      return persistAiEtf(connection, aiEtf, adjustType);
+    }
+    if (buildAiEtf) {
+      const tradeDate = latestIncomingTradeDate || (await fetchLatestSignalTradeDate(connection, adjustType));
+      const candidateResults = results.length ? results : await fetchAiEtfCandidateResults(connection, adjustType, tradeDate);
+      const previousHoldings = await fetchLatestAiEtfHoldingsBefore(connection, tradeDate, adjustType);
+      const portfolio = buildAiEtfPortfolio(candidateResults, adjustType, previousHoldings);
+      return persistAiEtf(connection, portfolio, adjustType);
+    }
+    return null;
   }
 
   app.get("/api/health", asyncHandler(async (_req, res) => {
@@ -1656,6 +2688,7 @@ ORDER BY stock_code, horizon, window_days
         ? req.body.results
         : null;
       const aiEtf = req.body?.aiEtf || null;
+      const buildAiEtf = Boolean(req.body?.buildAiEtf);
       if (!["none", "qfq", "hfq"].includes(adjustType)) {
         const error = new Error("adjustType 只支持 none/qfq/hfq");
         error.statusCode = 400;
@@ -1670,7 +2703,7 @@ ORDER BY stock_code, horizon, window_days
       let aiEtfResult = null;
       try {
         await connection.beginTransaction();
-        aiEtfResult = await persistIngestResults(connection, results, adjustType, aiEtf);
+        aiEtfResult = await persistIngestResults(connection, results, adjustType, aiEtf, buildAiEtf);
         await connection.commit();
       } catch (error) {
         await connection.rollback();

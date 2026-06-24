@@ -158,6 +158,21 @@ function sampleAiEtf() {
 
 function createRecordingPool() {
   const calls = [];
+  const aiEtfCandidates = Array.from({ length: 10 }, (_, index) => {
+    const result = makeServerAiEtfResult(index);
+    return {
+      code: result.code,
+      score: result.score,
+      signal: result.signal,
+      confidence: result.confidence,
+      regime: result.regime,
+      advice: result.advice,
+      horizon_scores_json: JSON.stringify(result.horizon_scores),
+      score_parts_json: JSON.stringify(result.parts || []),
+      source_errors_json: JSON.stringify(result.source_errors || []),
+      raw_analysis_json: JSON.stringify(result.raw),
+    };
+  });
   const connection = {
     calls,
     async beginTransaction() {
@@ -178,6 +193,68 @@ function createRecordingPool() {
               avg_return_pct: 1.25,
               avg_max_drawdown_pct: -2.1,
               avg_max_runup_pct: 4.2,
+            },
+          ],
+        ];
+      }
+      if (sql.includes('FROM stock_daily_signal_score') && sql.includes('MAX(trade_date) AS tradeDate')) {
+        return [[{ tradeDate: '2026-06-12' }]];
+      }
+      if (sql.includes('ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY trade_date DESC)')) {
+        return [
+          [
+            {
+              stock_code: '002466',
+              trade_date: '2026-06-11',
+              score: 60,
+              short_term_score: -8,
+              medium_term_score: 70,
+              long_term_score: 75,
+              horizon_scores_json: JSON.stringify({
+                medium_term: {
+                  label: '中期',
+                  score: 70,
+                  signal: '强买',
+                  parts: [{ module: '中期趋势', points: 18, reason: '上一期趋势较强' }],
+                },
+                long_term: {
+                  label: '长期',
+                  score: 75,
+                  signal: '强买',
+                  parts: [{ module: '长期质量', points: 20, reason: '上一期质量较强' }],
+                },
+              }),
+              score_parts_json: JSON.stringify([]),
+              raw_analysis_json: JSON.stringify({
+                technical_trend: {
+                  windows: [
+                    { days: 20, return_pct: 4.5 },
+                    { days: 60, return_pct: 8.5 },
+                    { days: 120, return_pct: 12.0 },
+                  ],
+                },
+              }),
+            },
+          ],
+        ];
+      }
+      if (
+        sql.includes('FROM stock_daily_signal_score') &&
+        sql.includes('horizon_scores_json') &&
+        sql.includes('WHERE adjust_type = ?') &&
+        sql.includes('AND trade_date = ?')
+      ) {
+        return [aiEtfCandidates];
+      }
+      if (sql.includes('FROM stock_daily_signal_score') && sql.includes('short_term_score')) {
+        return [
+          [
+            {
+              stock_code: '002466',
+              score: 60,
+              short_term_score: -8,
+              medium_term_score: 70,
+              long_term_score: 75,
             },
           ],
         ];
@@ -205,6 +282,22 @@ function createRecordingPool() {
         ];
       }
       if (sql.includes('FROM stock_ai_etf_holding')) {
+        if (sql.includes('raw_json')) {
+          return [
+            [
+              {
+                stock_code: '000009',
+                stock_name: '测试股票9',
+                industry: '测试行业',
+                target_weight_pct: 10,
+                reference_price: 19,
+                simulated_quantity: 5263,
+                simulated_notional: 100000,
+                raw_json: JSON.stringify({ firstHeldDate: '2026-05-01', tradeDate: '2026-05-01' }),
+              },
+            ],
+          ];
+        }
         return [
           [
             {
@@ -276,6 +369,45 @@ function createRecordingPool() {
         return [[{ ok: 1 }]];
       }
       return connection.query(sql, params);
+    },
+  };
+}
+
+function makeServerAiEtfResult(index) {
+  const code = `${index}`.padStart(6, '0');
+  const score = 80 - index;
+  return {
+    code,
+    name: `测试股票${index}`,
+    score,
+    signal: score >= 50 ? '强买' : '买入偏向',
+    confidence: '高',
+    regime: 'trend',
+    advice: '测试建议',
+    horizon_scores: {
+      short_term: { label: '短期', score: 35 - index, signal: '买入偏向' },
+      medium_term: { label: '中期', score: 65 - index, signal: '强买' },
+      long_term: { label: '长期', score: 75 - index, signal: '强买' },
+    },
+    parts: [],
+    source_errors: [],
+    raw: {
+      code,
+      name: `测试股票${index}`,
+      industry: '测试行业',
+      technical: { trade_date: '2026-06-12', latest_close: 10 + index },
+      technical_trend: {
+        rating: '技术趋势偏强',
+        score: 5,
+        windows: [
+          { days: 20, return_pct: 2 },
+          { days: 60, return_pct: 6 },
+          { days: 120, return_pct: 8 },
+        ],
+      },
+      metrics: [],
+      strengths: [],
+      risks: [],
     },
   };
 }
@@ -401,6 +533,13 @@ test('POST /api/ingest/daily-analysis persists results and refreshes reports in 
     pool.calls.some((call) => call.type === 'query' && call.params.some((param) => String(param).includes('## 历史验证'))),
     true,
   );
+  const reportCall = pool.calls.find(
+    (call) => call.type === 'query' && call.sql.includes('INSERT INTO stock_daily_report'),
+  );
+  assert.ok(reportCall);
+  assert.match(reportCall.params[5], /## 历史分数对照/);
+  assert.match(reportCall.params[5], /中期依据：/);
+  assert.ok(JSON.parse(reportCall.params[7]).historical_score_context);
 });
 
 test('POST /api/ingest/daily-analysis builds report conclusion from horizon alignment', async () => {
@@ -453,6 +592,33 @@ test('POST /api/ingest/daily-analysis persists optional AI ETF payload', async (
   assert.match(sqlText, /INSERT INTO stock_ai_etf_snapshot/);
   assert.match(sqlText, /INSERT INTO stock_ai_etf_holding/);
   assert.match(sqlText, /INSERT INTO stock_ai_etf_trade/);
+});
+
+test('POST /api/ingest/daily-analysis can build AI ETF from persisted latest candidates', async () => {
+  const pool = createRecordingPool();
+  const app = createApp({ pool, ingestToken: 'secret', projectRootPath: '/tmp/no-static-dist' });
+
+  await withServer(app, async (server) => {
+    const response = await postJson(
+      server,
+      '/api/ingest/daily-analysis',
+      { adjustType: 'qfq', results: [], buildAiEtf: true },
+      { authorization: 'Bearer secret' },
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.aiEtf?.portfolioName, 'AI_RECOMMENDED_ETF');
+    assert.equal(response.body.aiEtf?.holdingCount, 10);
+  });
+
+  const snapshotInsert = pool.calls.find(
+    (call) => call.type === 'query' && call.sql.includes('INSERT INTO stock_ai_etf_snapshot'),
+  );
+  assert.ok(snapshotInsert);
+  assert.equal(
+    pool.calls.some((call) => call.type === 'query' && call.sql.includes('horizon_scores_json')),
+    true,
+  );
 });
 
 test('GET /api/ai-etf returns latest portfolio snapshot with holdings and rebalance', async () => {

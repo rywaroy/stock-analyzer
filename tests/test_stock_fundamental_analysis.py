@@ -5117,6 +5117,128 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertNotIn("强买入偏向，但仍应等待成交量和趋势继续确认。", report_text)
         self.assertEqual(report_json["conclusion"], "周期证据分歧，优先观察确认。")
 
+    def test_generate_final_report_includes_historical_score_context(self):
+        result = {
+            "code": "002466",
+            "name": "天齐锂业",
+            "score": 45,
+            "signal": "买入偏向",
+            "confidence": "高",
+            "regime": "mixed",
+            "advice": "中长期走弱后先观察。",
+            "horizon_scores": {
+                "short_term": {"label": "短期", "score": -5, "signal": "观望"},
+                "medium_term": {
+                    "label": "中期",
+                    "score": 42,
+                    "signal": "买入偏向",
+                    "parts": [{"module": "中期趋势", "points": 6, "reason": "20/60 日趋势转弱"}],
+                },
+                "long_term": {
+                    "label": "长期",
+                    "score": 50,
+                    "signal": "强买",
+                    "parts": [{"module": "长期质量", "points": 16, "reason": "质量尚可"}],
+                },
+            },
+            "strategy_adjustments": [],
+            "parts": [],
+            "source_errors": [],
+            "raw": {
+                "code": "002466",
+                "name": "天齐锂业",
+                "report_date": "2026-03-31",
+                "technical": {"trade_date": "2026-06-12", "latest_close": 62.5},
+                "technical_trend": {
+                    "rating": "技术趋势震荡",
+                    "score": 1,
+                    "conclusion": "趋势震荡。",
+                    "windows": [
+                        {"days": 20, "return_pct": -8},
+                        {"days": 60, "return_pct": -2},
+                        {"days": 120, "return_pct": 3},
+                    ],
+                },
+                "metrics": [{"label": "ROE", "value": 12.0}],
+                "strengths": [],
+                "risks": [],
+            },
+        }
+        historical_rows = [
+            {
+                "stock_code": "002466",
+                "trade_date": "2026-06-10",
+                "score": 70,
+                "medium_term_score": 68,
+                "long_term_score": 66,
+                "horizon_scores_json": {
+                    "medium_term": {
+                        "label": "中期",
+                        "score": 68,
+                        "signal": "强买",
+                        "parts": [{"module": "中期趋势", "points": 18, "reason": "趋势强"}],
+                    },
+                    "long_term": {
+                        "label": "长期",
+                        "score": 66,
+                        "signal": "强买",
+                        "parts": [{"module": "长期质量", "points": 18, "reason": "质量强"}],
+                    },
+                },
+                "raw_analysis_json": {
+                    "technical_trend": {
+                        "windows": [
+                            {"days": 20, "return_pct": 5},
+                            {"days": 60, "return_pct": 7},
+                            {"days": 120, "return_pct": 9},
+                        ]
+                    }
+                },
+            },
+            {
+                "stock_code": "002466",
+                "trade_date": "2026-06-11",
+                "score": 75,
+                "medium_term_score": 72,
+                "long_term_score": 70,
+                "horizon_scores_json": {
+                    "medium_term": {
+                        "label": "中期",
+                        "score": 72,
+                        "signal": "强买",
+                        "parts": [{"module": "中期趋势", "points": 20, "reason": "趋势强"}],
+                    },
+                    "long_term": {
+                        "label": "长期",
+                        "score": 70,
+                        "signal": "强买",
+                        "parts": [{"module": "长期质量", "points": 18, "reason": "质量强"}],
+                    },
+                },
+                "raw_analysis_json": {
+                    "technical_trend": {
+                        "windows": [
+                            {"days": 20, "return_pct": 4},
+                            {"days": 60, "return_pct": 8},
+                            {"days": 120, "return_pct": 10},
+                        ]
+                    }
+                },
+            },
+        ]
+
+        context = mysql_sink.build_historical_score_context(result, historical_rows)
+        result["historical_score_context"] = context
+        _, report_text, report_json = mysql_sink.generate_final_report(result)
+
+        self.assertEqual(context["previousTradeDate"], "2026-06-11")
+        self.assertEqual(context["horizons"]["medium_term"]["deltaFromPrevious"], -30)
+        self.assertIn("## 历史分数对照", report_text)
+        self.assertIn("中期：当前 42/100；上一期 72/100", report_text)
+        self.assertIn("近 20 日收益从 4.00% 变为 -8.00%", report_text)
+        self.assertIn("评分项「中期趋势」", report_text)
+        self.assertEqual(report_json["historical_score_context"]["lookbackCount"], 2)
+
     def test_buy_signal_scorer_returns_three_horizon_scores(self):
         scorer = load_signal_scorer()
         result = scorer.score_item(
@@ -5529,6 +5651,50 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertIn("window_days", sql)
         self.assertIn("raw_signal_json", sql)
 
+    def test_apply_score_stability_dampens_medium_and_long_term_daily_noise(self):
+        result = make_ai_etf_result(0)
+        result["score"] = 30
+        result["signal"] = "买入偏向"
+        result["horizon_scores"]["medium_term"]["score"] = 30
+        result["horizon_scores"]["long_term"]["score"] = 20
+        result["raw"]["technical_trend"]["windows"] = [
+            {"days": 20, "return_pct": -2},
+            {"days": 60, "return_pct": 4},
+            {"days": 120, "return_pct": 6},
+        ]
+        previous_scores = [
+            {
+                "stock_code": "000000",
+                "score": 90,
+                "medium_term_score": 90,
+                "long_term_score": 88,
+            }
+        ]
+
+        mysql_sink.apply_score_stability([result], previous_scores)
+
+        self.assertEqual(result["score"], 65)
+        self.assertEqual(result["signal"], "强买")
+        self.assertEqual(result["horizon_scores"]["medium_term"]["score"], 72)
+        self.assertEqual(result["horizon_scores"]["long_term"]["score"], 76)
+        self.assertEqual(result["horizon_scores"]["medium_term"]["signal"], "强买")
+        self.assertEqual(result["stability_adjustments"][0]["rawScore"], 30)
+        self.assertIn("稳定器", result["horizon_scores"]["medium_term"]["parts"][-1]["module"])
+
+    def test_apply_score_stability_allows_hard_medium_term_break(self):
+        result = make_ai_etf_result(0)
+        result["horizon_scores"]["medium_term"]["score"] = 20
+        result["raw"]["technical_trend"]["windows"] = [
+            {"days": 20, "return_pct": -12},
+            {"days": 60, "return_pct": -4},
+        ]
+        previous_scores = [{"stock_code": "000000", "medium_term_score": 90}]
+
+        mysql_sink.apply_score_stability([result], previous_scores)
+
+        self.assertEqual(result["horizon_scores"]["medium_term"]["score"], 20)
+        self.assertNotIn("stability_adjustments", result)
+
     def test_build_ai_etf_portfolio_selects_ten_equal_weight_initial_holdings(self):
         results = [make_ai_etf_result(index) for index in range(12)]
 
@@ -5563,9 +5729,27 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
     def test_build_ai_etf_portfolio_marks_rebalance_actions_from_previous_holdings(self):
         results = [make_ai_etf_result(index) for index in range(12)]
         previous_holdings = [
-            {"stock_code": "000000", "target_weight_pct": 8, "reference_price": 9, "simulated_quantity": 8000},
-            {"stock_code": "000001", "target_weight_pct": 12, "reference_price": 10, "simulated_quantity": 12000},
-            {"stock_code": "999999", "target_weight_pct": 10, "reference_price": 20, "simulated_quantity": 5000},
+            {
+                "stock_code": "000000",
+                "target_weight_pct": 8,
+                "reference_price": 9,
+                "simulated_quantity": 8000,
+                "first_held_date": "2026-05-01",
+            },
+            {
+                "stock_code": "000001",
+                "target_weight_pct": 12,
+                "reference_price": 10,
+                "simulated_quantity": 12000,
+                "first_held_date": "2026-05-01",
+            },
+            {
+                "stock_code": "999999",
+                "target_weight_pct": 10,
+                "reference_price": 20,
+                "simulated_quantity": 5000,
+                "first_held_date": "2026-05-01",
+            },
         ]
 
         portfolio = mysql_sink.build_ai_etf_portfolio(results, "qfq", previous_holdings=previous_holdings)
@@ -5576,6 +5760,49 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertIn(actions["000001"], {"reduce", "hold"})
         self.assertTrue(any(item["action"] == "buy" for item in portfolio["rebalance"]))
         self.assertTrue(all("weightDeltaPct" in item for item in portfolio["rebalance"]))
+
+    def test_build_ai_etf_portfolio_keeps_existing_holding_outside_top_ten_until_risk_breaks(self):
+        results = [make_ai_etf_result(index) for index in range(12)]
+        lagging_holding = results[11]
+        lagging_holding["horizon_scores"]["medium_term"]["score"] = 8
+        lagging_holding["horizon_scores"]["long_term"]["score"] = 9
+        previous_holdings = [
+            {
+                "stock_code": lagging_holding["code"],
+                "target_weight_pct": 10,
+                "reference_price": 20,
+                "simulated_quantity": 5000,
+                "first_held_date": "2026-06-01",
+            }
+        ]
+
+        portfolio = mysql_sink.build_ai_etf_portfolio(results, "qfq", previous_holdings=previous_holdings)
+        actions = {item["stockCode"]: item["action"] for item in portfolio["rebalance"]}
+
+        self.assertIn(lagging_holding["code"], {holding["stockCode"] for holding in portfolio["holdings"] if holding["targetWeightPct"] > 0})
+        self.assertNotEqual(actions[lagging_holding["code"]], "sell")
+        self.assertIn("低换手", portfolio["selectionRule"])
+
+    def test_build_ai_etf_portfolio_sells_existing_holding_on_medium_term_break(self):
+        results = [make_ai_etf_result(index) for index in range(12)]
+        broken_holding = results[2]
+        broken_holding["horizon_scores"]["medium_term"]["score"] = -18
+        previous_holdings = [
+            {
+                "stock_code": broken_holding["code"],
+                "target_weight_pct": 10,
+                "reference_price": 20,
+                "simulated_quantity": 5000,
+                "first_held_date": "2026-05-01",
+            }
+        ]
+
+        portfolio = mysql_sink.build_ai_etf_portfolio(results, "qfq", previous_holdings=previous_holdings)
+        actions = {item["stockCode"]: item["action"] for item in portfolio["rebalance"]}
+
+        self.assertEqual(actions[broken_holding["code"]], "sell")
+        sell_trade = next(item for item in portfolio["rebalance"] if item["stockCode"] == broken_holding["code"])
+        self.assertIn("中期评分", sell_trade["reason"])
 
     def test_build_persist_sql_includes_ai_etf_upserts(self):
         results = [make_ai_etf_result(index) for index in range(10)]
@@ -5736,11 +5963,13 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         ensure_schema_mock.assert_not_called()
         persist_mock.assert_not_called()
-        upload_mock.assert_called_once()
-        uploaded_results, uploaded_args, adjust_type = upload_mock.call_args.args
+        self.assertEqual(upload_mock.call_count, 2)
+        uploaded_results, uploaded_args, adjust_type = upload_mock.call_args_list[0].args
         self.assertEqual(uploaded_results, [result])
         self.assertEqual(uploaded_args.ingest_token, "secret")
         self.assertEqual(adjust_type, "qfq")
+        self.assertEqual(upload_mock.call_args_list[1].args[0], [])
+        self.assertTrue(upload_mock.call_args_list[1].kwargs["build_ai_etf"])
 
     def test_main_uploads_results_in_batches_when_batch_size_is_set(self):
         items = [{"code": f"{index:06d}"} for index in range(25)]
@@ -5782,9 +6011,10 @@ class StockFundamentalAnalysisTest(unittest.TestCase):
         ensure_schema_mock.assert_not_called()
         persist_mock.assert_not_called()
         uploaded_batches = [call.args[0] for call in upload_mock.call_args_list]
-        self.assertEqual([len(batch) for batch in uploaded_batches], [10, 10, 5])
+        self.assertEqual([len(batch) for batch in uploaded_batches], [10, 10, 5, 0])
         self.assertEqual(uploaded_batches[0][0]["code"], "000000")
-        self.assertEqual(uploaded_batches[-1][-1]["code"], "000024")
+        self.assertEqual(uploaded_batches[-2][-1]["code"], "000024")
+        self.assertTrue(upload_mock.call_args_list[-1].kwargs["build_ai_etf"])
 
 
 if __name__ == "__main__":

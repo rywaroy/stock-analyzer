@@ -135,6 +135,24 @@ HORIZON_KEYS = [
 AI_ETF_PORTFOLIO_NAME = "AI_RECOMMENDED_ETF"
 AI_ETF_INITIAL_NOTIONAL = 1_000_000.0
 AI_ETF_TARGET_COUNT = 10
+AI_ETF_WEIGHT_CHANGE_THRESHOLD = 0.5
+AI_ETF_MIN_HOLD_DAYS = 20
+AI_ETF_SELL_MEDIUM_THRESHOLD = -15
+AI_ETF_SELL_LONG_THRESHOLD = -15
+AI_ETF_ENTRY_MEDIUM_THRESHOLD = 25
+AI_ETF_ENTRY_LONG_THRESHOLD = 20
+
+HORIZON_STABILITY_MAX_DELTA = {
+    "medium_term": 18,
+    "long_term": 12,
+}
+TOTAL_SCORE_STABILITY_MAX_DELTA = 25
+HISTORICAL_SCORE_LOOKBACK_ROWS = 20
+HISTORY_SCORE_HORIZONS = [
+    ("overall", "总分", "score", []),
+    ("medium_term", "中期", "medium_term_score", [20, 60, 120]),
+    ("long_term", "长期", "long_term_score", [60, 120, 250]),
+]
 
 
 def is_star_market_stock(code: Any) -> bool:
@@ -154,6 +172,320 @@ def horizon_scores(result: dict[str, Any]) -> dict[str, Any]:
 
 def horizon_value(result: dict[str, Any], key: str, field: str) -> Any:
     return (horizon_scores(result).get(key) or {}).get(field)
+
+
+def signal_label_from_score(score: Any) -> str:
+    numeric = int_number(score)
+    if numeric is None:
+        return "观望"
+    if numeric >= 50:
+        return "强买"
+    if numeric >= 15:
+        return "买入偏向"
+    if numeric > -15:
+        return "观望"
+    if numeric > -50:
+        return "卖出偏向"
+    return "强卖/回避"
+
+
+def parse_json_value(value: Any, default: Any) -> Any:
+    if value is None or value == "":
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value))
+    except json.JSONDecodeError:
+        return default
+
+
+def format_signed_number(value: Any, digits: int = 0) -> str:
+    numeric = number(value)
+    if numeric is None:
+        return "暂无"
+    sign = "+" if numeric > 0 else ""
+    return f"{sign}{numeric:.{digits}f}"
+
+
+def score_change_word(delta: Any) -> str:
+    numeric = number(delta)
+    if numeric is None:
+        return "变化"
+    if numeric > 0:
+        return "升高"
+    if numeric < 0:
+        return "下降"
+    return "持平"
+
+
+def result_score_for_horizon(result: dict[str, Any], horizon: str) -> int | None:
+    if horizon == "overall":
+        return int_number(result.get("score"))
+    return int_number(horizon_value(result, horizon, "score"))
+
+
+def row_score_for_horizon(row: dict[str, Any], field: str) -> int | None:
+    camel_field = "".join(
+        part if index == 0 else part[:1].upper() + part[1:]
+        for index, part in enumerate(field.split("_"))
+    )
+    return int_number(value_from_mapping(row, field, camel_field))
+
+
+def trade_date_from_row(row: dict[str, Any]) -> str:
+    value = value_from_mapping(row, "trade_date", "tradeDate")
+    return str(value or "")[:10]
+
+
+def raw_analysis_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    raw = value_from_mapping(row, "raw_analysis_json", "rawAnalysisJson", "raw_analysis", "raw")
+    parsed = parse_json_value(raw, {})
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def horizon_scores_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    horizons = value_from_mapping(row, "horizon_scores_json", "horizonScoresJson", "horizon_scores", "horizonScores")
+    parsed = parse_json_value(horizons, {})
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def trend_return_from_raw(raw: dict[str, Any], days: int) -> float | None:
+    trend = raw.get("technical_trend") or {}
+    for window in trend.get("windows") or []:
+        if int_number(window.get("days")) == days:
+            return number(window.get("return_pct"))
+    return None
+
+
+def score_parts_by_module(horizon_info: dict[str, Any]) -> dict[str, float]:
+    modules: dict[str, float] = {}
+    for part in horizon_info.get("parts") or []:
+        module = str(part.get("module") or "").strip()
+        points = number(part.get("points"))
+        if not module or points is None:
+            continue
+        modules[module] = modules.get(module, 0.0) + points
+    return modules
+
+
+def top_score_parts(horizon_info: dict[str, Any], limit: int = 3) -> list[dict[str, Any]]:
+    parts = []
+    for part in horizon_info.get("parts") or []:
+        module = str(part.get("module") or "").strip()
+        points = number(part.get("points"))
+        if not module or points is None:
+            continue
+        parts.append({"module": module, "points": round(points, 2), "reason": str(part.get("reason") or "")})
+    parts.sort(key=lambda item: abs(number(item.get("points")) or 0), reverse=True)
+    return parts[:limit]
+
+
+def format_key_parts(parts: list[dict[str, Any]]) -> str:
+    if not parts:
+        return "暂无"
+    return "；".join(
+        f"{part.get('module')} {format_signed_number(part.get('points'), 2)} 分" for part in parts
+    )
+
+
+def build_part_comparisons(
+    previous_horizon: dict[str, Any],
+    current_horizon: dict[str, Any],
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    previous_parts = score_parts_by_module(previous_horizon)
+    current_parts = score_parts_by_module(current_horizon)
+    comparisons = []
+    for module in sorted(set(previous_parts) | set(current_parts)):
+        previous_points = previous_parts.get(module, 0.0)
+        current_points = current_parts.get(module, 0.0)
+        delta = current_points - previous_points
+        if abs(delta) < 2:
+            continue
+        comparisons.append(
+            {
+                "module": module,
+                "previousPoints": round(previous_points, 2),
+                "currentPoints": round(current_points, 2),
+                "deltaPoints": round(delta, 2),
+            }
+        )
+    comparisons.sort(key=lambda item: abs(number(item.get("deltaPoints")) or 0), reverse=True)
+    return comparisons[:limit]
+
+
+def build_trend_comparisons(
+    result: dict[str, Any],
+    previous_row: dict[str, Any],
+    days_list: list[int],
+) -> list[dict[str, Any]]:
+    current_raw = result.get("raw") or {}
+    previous_raw = raw_analysis_from_row(previous_row)
+    comparisons = []
+    for days in days_list:
+        previous_return = trend_return_from_raw(previous_raw, days)
+        current_return = trend_return_from_raw(current_raw, days)
+        if previous_return is None or current_return is None:
+            continue
+        comparisons.append(
+            {
+                "days": days,
+                "previousReturnPct": round(previous_return, 2),
+                "currentReturnPct": round(current_return, 2),
+                "deltaPct": round(current_return - previous_return, 2),
+            }
+        )
+    return comparisons
+
+
+def matching_stability_adjustment(result: dict[str, Any], horizon: str) -> dict[str, Any] | None:
+    for adjustment in result.get("stability_adjustments") or []:
+        if str(adjustment.get("horizon") or "") == horizon:
+            return adjustment
+    return None
+
+
+def build_history_explanations(
+    label: str,
+    score_summary: dict[str, Any],
+    trend_comparisons: list[dict[str, Any]],
+    part_comparisons: list[dict[str, Any]],
+    stability_adjustment: dict[str, Any] | None,
+) -> list[str]:
+    explanations = []
+    delta = number(score_summary.get("deltaFromPrevious"))
+    if delta is not None and abs(delta) >= 10:
+        explanations.append(f"{label}较上一期{score_change_word(delta)} {abs(delta):.0f} 分，需要结合历史证据复核。")
+
+    trend_explanation_count = 0
+    for comparison in trend_comparisons:
+        trend_delta = number(comparison.get("deltaPct"))
+        if trend_delta is None or abs(trend_delta) < 3:
+            continue
+        direction = "改善" if trend_delta > 0 else "走弱"
+        explanations.append(
+            f"近 {comparison.get('days')} 日收益从 {format_percent(comparison.get('previousReturnPct'))} "
+            f"变为 {format_percent(comparison.get('currentReturnPct'))}，{direction} {abs(trend_delta):.2f} 个百分点。"
+        )
+        trend_explanation_count += 1
+        if trend_explanation_count >= 2:
+            break
+
+    if stability_adjustment:
+        explanations.append(
+            f"稳定器参考上一期 {stability_adjustment.get('previousScore')}/100，"
+            f"将原始 {stability_adjustment.get('rawScore')}/100 调整为 "
+            f"{stability_adjustment.get('stabilizedScore')}/100。"
+        )
+
+    for comparison in part_comparisons:
+        explanations.append(
+            f"评分项「{comparison.get('module')}」从 {format_signed_number(comparison.get('previousPoints'), 2)} "
+            f"分变为 {format_signed_number(comparison.get('currentPoints'), 2)} 分，"
+            f"变化 {format_signed_number(comparison.get('deltaPoints'), 2)} 分。"
+        )
+
+    if not explanations:
+        explanations.append(f"{label}历史分数和核心证据变化有限，当前判断主要延续上一期。")
+    return explanations[:4]
+
+
+def build_historical_score_context(
+    result: dict[str, Any],
+    historical_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rows = sorted((row for row in historical_rows if trade_date_from_row(row)), key=trade_date_from_row)
+    if not rows:
+        return {}
+    previous_row = rows[-1]
+    previous_horizons = horizon_scores_from_row(previous_row)
+    horizons: dict[str, Any] = {}
+    for horizon, label, field, days_list in HISTORY_SCORE_HORIZONS:
+        values = [row_score_for_horizon(row, field) for row in rows]
+        numeric_values = [value for value in values if value is not None]
+        current_score = result_score_for_horizon(result, horizon)
+        previous_score = row_score_for_horizon(previous_row, field)
+        if current_score is None or previous_score is None:
+            continue
+        recent_average = round(sum(numeric_values) / len(numeric_values), 1) if numeric_values else None
+        score_summary = {
+            "label": label,
+            "currentScore": current_score,
+            "previousScore": previous_score,
+            "deltaFromPrevious": current_score - previous_score,
+            "recentAverage": recent_average,
+            "recentMin": min(numeric_values) if numeric_values else None,
+            "recentMax": max(numeric_values) if numeric_values else None,
+            "deltaFromAverage": round(current_score - recent_average, 1) if recent_average is not None else None,
+            "currentSignal": signal_label_from_score(current_score),
+            "previousSignal": signal_label_from_score(previous_score),
+        }
+        if horizon != "overall":
+            current_horizon = horizon_scores(result).get(horizon) or {}
+            previous_horizon = previous_horizons.get(horizon) or {}
+            trend_comparisons = build_trend_comparisons(result, previous_row, days_list)
+            part_comparisons = build_part_comparisons(previous_horizon, current_horizon)
+            score_summary["trendComparisons"] = trend_comparisons
+            score_summary["partComparisons"] = part_comparisons
+            score_summary["previousKeyParts"] = top_score_parts(previous_horizon)
+            score_summary["currentKeyParts"] = top_score_parts(current_horizon)
+            score_summary["explanations"] = build_history_explanations(
+                label,
+                score_summary,
+                trend_comparisons,
+                part_comparisons,
+                matching_stability_adjustment(result, horizon),
+            )
+        horizons[horizon] = score_summary
+    return {
+        "lookbackCount": len(rows),
+        "previousTradeDate": trade_date_from_row(previous_row),
+        "horizons": horizons,
+    }
+
+
+def apply_historical_score_context(
+    results: list[dict[str, Any]],
+    historical_scores_by_code: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    for result in results:
+        code = str(result.get("code") or "")
+        context = build_historical_score_context(result, historical_scores_by_code.get(code, []))
+        if context:
+            result["historical_score_context"] = context
+    return results
+
+
+def historical_score_context_lines(context: dict[str, Any]) -> list[str]:
+    horizons = context.get("horizons") or {}
+    if not horizons:
+        return []
+    lookback = context.get("lookbackCount")
+    previous_date = context.get("previousTradeDate") or "暂无"
+    lines = [f"- 对比窗口：最近 {lookback} 次历史评分；上一期：{previous_date}。"]
+    for key in ["overall", "medium_term", "long_term"]:
+        item = horizons.get(key) or {}
+        if not item:
+            continue
+        delta = number(item.get("deltaFromPrevious"))
+        delta_phrase = "暂无"
+        if delta is not None:
+            delta_phrase = f"{score_change_word(delta)} {abs(delta):.0f} 分"
+        lines.append(
+            f"- {item.get('label') or key}：当前 {item.get('currentScore')}/100；"
+            f"上一期 {item.get('previousScore')}/100（{delta_phrase}）；"
+            f"近 {lookback} 次均值 {format_decimal(item.get('recentAverage'), 1)}，"
+            f"区间 {item.get('recentMin')}~{item.get('recentMax')}。"
+        )
+        if key in {"medium_term", "long_term"}:
+            lines.append(
+                f"- {item.get('label') or key}评分项：上一期 {format_key_parts(item.get('previousKeyParts') or [])}；"
+                f"本期 {format_key_parts(item.get('currentKeyParts') or [])}。"
+            )
+            for explanation in item.get("explanations") or []:
+                lines.append(f"- {item.get('label') or key}依据：{explanation}")
+    return lines
 
 
 def horizon_summary_lines(result: dict[str, Any]) -> list[str]:
@@ -261,6 +593,9 @@ def generate_final_report(result: dict[str, Any]) -> tuple[str, str, dict[str, A
     risks = item.get("risks") or ["暂无明确风险"]
     accuracy_lines = evaluation_summary_lines(result)
     strategy_adjustments = result.get("strategy_adjustments") or []
+    stability_adjustments = result.get("stability_adjustments") or []
+    historical_context = result.get("historical_score_context") or {}
+    historical_lines = historical_score_context_lines(historical_context)
 
     lines = [
         f"# {display_name} 最终分析报告",
@@ -302,6 +637,9 @@ def generate_final_report(result: dict[str, Any]) -> tuple[str, str, dict[str, A
     if accuracy_lines:
         lines.extend(["", "## 历史验证", ""])
         lines.extend(accuracy_lines)
+    if historical_lines:
+        lines.extend(["", "## 历史分数对照", ""])
+        lines.extend(historical_lines)
     if strategy_adjustments:
         lines.extend(["", "## 复盘与自学习", ""])
         horizons = horizon_scores(result)
@@ -311,6 +649,16 @@ def generate_final_report(result: dict[str, Any]) -> tuple[str, str, dict[str, A
             adjustment_id = str(adjustment.get("id") or "unknown")
             reason = str(adjustment.get("reason") or "暂无原因")
             lines.append(f"- {horizon}：{adjustment_id}，{reason}")
+    if stability_adjustments:
+        lines.extend(["", "## 评分稳定性", ""])
+        for adjustment in stability_adjustments:
+            horizon = str(adjustment.get("horizon") or "unknown")
+            lines.append(
+                "- "
+                f"{horizon}：上一期 {adjustment.get('previousScore')}，"
+                f"原始 {adjustment.get('rawScore')}，"
+                f"稳定后 {adjustment.get('stabilizedScore')}。"
+            )
     lines.extend(["", "## 操作建议", "", result["advice"]])
     if source_errors:
         lines.extend(["", "## 数据提醒", ""])
@@ -325,12 +673,15 @@ def generate_final_report(result: dict[str, Any]) -> tuple[str, str, dict[str, A
         "advice": result["advice"],
         "horizon_scores": horizon_scores(result),
         "strategy_adjustments": strategy_adjustments,
+        "stability_adjustments": stability_adjustments,
         "strengths": strengths,
         "risks": risks,
         "source_errors": source_errors,
     }
     if "evaluation_summary" in result:
         report_json["evaluation_summary"] = result.get("evaluation_summary")
+    if historical_context:
+        report_json["historical_score_context"] = historical_context
     return title, report_text, report_json
 
 
@@ -380,24 +731,26 @@ def normalized_action(previous_weight: float, target_weight: float) -> str:
         return "buy"
     if previous_weight > 0 and target_weight <= 0:
         return "sell"
-    if delta > 0.01:
+    if delta > AI_ETF_WEIGHT_CHANGE_THRESHOLD:
         return "increase"
-    if delta < -0.01:
+    if delta < -AI_ETF_WEIGHT_CHANGE_THRESHOLD:
         return "reduce"
     return "hold"
 
 
-def action_reason(action: str, result: dict[str, Any] | None = None) -> str:
+def action_reason(action: str, result: dict[str, Any] | None = None, detail: str | None = None) -> str:
+    if detail:
+        return detail
     if action == "buy":
-        return "新纳入组合，三周期综合评分进入前十。"
+        return "新纳入组合，已经通过观察池质量筛选。"
     if action == "sell":
-        return "不再进入本期前十，按调仓参考价模拟卖出。"
+        return "持仓质量不再满足组合纪律，按调仓参考价模拟卖出。"
     if action == "increase":
-        return "继续保留且目标权重提高。"
+        return "继续保留且目标权重随中长期胜率和组合约束小幅提高。"
     if action == "reduce":
-        return "继续保留但目标权重下调。"
+        return "继续保留但目标权重随中长期胜率和风险约束小幅下调。"
     if result:
-        return "继续保留，评分和风险状态仍满足组合要求。"
+        return "继续保留，评分和风险状态仍满足组合纪律。"
     return "本期无仓位变化。"
 
 
@@ -415,6 +768,177 @@ def round_weight(value: float) -> float:
     return round(value, 4)
 
 
+def clamp_weight(value: float, lower: float = 5.0, upper: float = 15.0) -> float:
+    return max(lower, min(upper, value))
+
+
+def trend_window_return(result: dict[str, Any], days: int) -> float | None:
+    trend = ((result.get("raw") or {}).get("technical_trend") or {})
+    for window in trend.get("windows") or []:
+        if int_number(window.get("days")) == days:
+            return number(window.get("return_pct"))
+    return None
+
+
+def ai_etf_valid_candidate(result: dict[str, Any]) -> bool:
+    return (
+        result_trade_date(result) != ""
+        and result_close_price(result) is not None
+        and str(result.get("code") or "") != ""
+        and not is_star_market_stock(result.get("code"))
+        and result.get("confidence") != "低"
+        and not (result.get("source_errors") or [])
+        and ai_etf_horizon_score(result, "medium_term") > 0
+        and ai_etf_horizon_score(result, "long_term") > 0
+    )
+
+
+def ai_etf_entry_candidate(result: dict[str, Any]) -> bool:
+    return (
+        ai_etf_valid_candidate(result)
+        and ai_etf_horizon_score(result, "medium_term") >= AI_ETF_ENTRY_MEDIUM_THRESHOLD
+        and ai_etf_horizon_score(result, "long_term") >= AI_ETF_ENTRY_LONG_THRESHOLD
+    )
+
+
+def parse_trade_date(value: Any) -> dt.date | None:
+    if not value:
+        return None
+    try:
+        return dt.date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def previous_holding_days(previous: dict[str, Any], trade_date: str) -> int | None:
+    first_held = parse_trade_date(value_from_mapping(previous, "first_held_date", "firstHeldDate", "trade_date", "tradeDate"))
+    current = parse_trade_date(trade_date)
+    if not first_held or not current:
+        return None
+    return max(0, (current - first_held).days)
+
+
+def previous_first_held_date(previous: dict[str, Any], trade_date: str) -> str:
+    return str(
+        value_from_mapping(previous, "first_held_date", "firstHeldDate", "trade_date", "tradeDate")
+        or trade_date
+    )
+
+
+def ai_etf_should_sell(result: dict[str, Any] | None, previous: dict[str, Any], trade_date: str) -> tuple[bool, str]:
+    if result is None:
+        return True, "本期分析结果缺失，无法继续验证持仓逻辑。"
+    medium_score = ai_etf_horizon_score(result, "medium_term")
+    long_score = ai_etf_horizon_score(result, "long_term")
+    source_errors = result.get("source_errors") or []
+    confidence = result.get("confidence")
+    severe_break = medium_score <= -30 or long_score <= -30
+    if source_errors:
+        return True, "关键数据源异常，组合不继续承担无法验证的持仓风险。"
+    if confidence == "低":
+        return True, "评分置信度降为低，退出组合等待重新观察。"
+    if medium_score <= AI_ETF_SELL_MEDIUM_THRESHOLD:
+        return True, f"中期评分降至 {medium_score:.0f}，触发组合卖出纪律。"
+    if long_score <= AI_ETF_SELL_LONG_THRESHOLD:
+        return True, f"长期评分降至 {long_score:.0f}，触发组合卖出纪律。"
+    held_days = previous_holding_days(previous, trade_date)
+    if held_days is not None and held_days < AI_ETF_MIN_HOLD_DAYS and not severe_break:
+        return False, f"持仓仅 {held_days} 天，未触发硬性风控，维持最小持有期纪律。"
+    if not ai_etf_valid_candidate(result):
+        return True, "中长期质量不再满足组合观察池要求。"
+    return False, "继续保留，仍符合中长期持仓纪律。"
+
+
+def bounded_normalize_weights(raw_weights: dict[str, float], lower: float = 5.0, upper: float = 15.0) -> dict[str, float]:
+    if not raw_weights:
+        return {}
+    weights = {code: clamp_weight(value, lower, upper) for code, value in raw_weights.items()}
+    for _ in range(20):
+        total = sum(weights.values())
+        diff = 100.0 - total
+        if abs(diff) < 0.0001:
+            break
+        if diff > 0:
+            adjustable = [code for code, value in weights.items() if value < upper]
+        else:
+            adjustable = [code for code, value in weights.items() if value > lower]
+        if not adjustable:
+            break
+        step = diff / len(adjustable)
+        for code in adjustable:
+            weights[code] = clamp_weight(weights[code] + step, lower, upper)
+
+    rounded = {code: round_weight(value) for code, value in weights.items()}
+    residual = round_weight(100.0 - sum(rounded.values()))
+    if residual:
+        if residual > 0:
+            target = max(rounded, key=lambda code: upper - rounded[code])
+        else:
+            target = max(rounded, key=lambda code: rounded[code] - lower)
+        rounded[target] = round_weight(rounded[target] + residual)
+    return rounded
+
+
+def target_weights_for_selection(selected: list[dict[str, Any]], previous_by_code: dict[str, dict[str, Any]]) -> dict[str, float]:
+    if not selected:
+        return {}
+    if not previous_by_code:
+        return {str(result.get("code")): round_weight(100.0 / len(selected)) for result in selected}
+
+    rank_scores = [ai_etf_rank_score(result) for result in selected]
+    average_rank = sum(rank_scores) / len(rank_scores)
+    raw_weights: dict[str, float] = {}
+    for result, rank_score in zip(selected, rank_scores, strict=False):
+        code = str(result.get("code"))
+        desired = clamp_weight(10.0 + (rank_score - average_rank) * 0.08)
+        previous = previous_by_code.get(code) or {}
+        previous_weight = number(value_from_mapping(previous, "target_weight_pct", "targetWeightPct"))
+        raw_weights[code] = previous_weight * 0.7 + desired * 0.3 if previous_weight else desired
+    return bounded_normalize_weights(raw_weights)
+
+
+def select_ai_etf_holdings(
+    candidates: list[dict[str, Any]],
+    previous_by_code: dict[str, dict[str, Any]],
+    trade_date: str,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    result_by_code = {str(result.get("code")): result for result in candidates}
+    retained: list[dict[str, Any]] = []
+    sell_reasons: dict[str, str] = {}
+
+    for code, previous in previous_by_code.items():
+        previous_weight = number(value_from_mapping(previous, "target_weight_pct", "targetWeightPct")) or 0.0
+        if previous_weight <= 0:
+            continue
+        should_sell, reason = ai_etf_should_sell(result_by_code.get(code), previous, trade_date)
+        if should_sell:
+            sell_reasons[code] = reason
+        elif code in result_by_code:
+            retained.append(result_by_code[code])
+
+    retained = sorted(retained, key=ai_etf_rank_score, reverse=True)[:AI_ETF_TARGET_COUNT]
+    selected_codes = {str(result.get("code")) for result in retained}
+    entry_candidates = [
+        result
+        for result in candidates
+        if str(result.get("code")) not in selected_codes and ai_etf_entry_candidate(result)
+    ]
+    fallback_candidates = [
+        result
+        for result in candidates
+        if str(result.get("code")) not in selected_codes and ai_etf_valid_candidate(result)
+    ]
+    fill_pool = sorted(entry_candidates, key=ai_etf_rank_score, reverse=True)
+    if len(retained) + len(fill_pool) < AI_ETF_TARGET_COUNT:
+        known = {str(result.get("code")) for result in fill_pool}
+        fill_pool.extend(
+            result
+            for result in sorted(fallback_candidates, key=ai_etf_rank_score, reverse=True)
+            if str(result.get("code")) not in known
+        )
+    return (retained + fill_pool)[:AI_ETF_TARGET_COUNT], sell_reasons
+
+
 def build_ai_etf_portfolio(
     results: list[dict[str, Any]],
     adjust_type: str,
@@ -428,14 +952,15 @@ def build_ai_etf_portfolio(
         and str(result.get("code") or "")
         and not is_star_market_stock(result.get("code"))
     ]
-    if len(candidates) < AI_ETF_TARGET_COUNT:
+    if not candidates:
+        return None
+    previous_by_code = previous_holding_by_code(previous_holdings)
+    trade_date = max(result_trade_date(result) for result in candidates)
+    selected, sell_reasons = select_ai_etf_holdings(candidates, previous_by_code, trade_date)
+    if len(selected) < AI_ETF_TARGET_COUNT:
         return None
 
-    ranked = sorted(candidates, key=lambda item: (ai_etf_rank_score(item), number(item.get("score")) or 0), reverse=True)
-    selected = ranked[:AI_ETF_TARGET_COUNT]
-    trade_date = result_trade_date(selected[0])
-    previous_by_code = previous_holding_by_code(previous_holdings)
-    target_weight = round_weight(100.0 / AI_ETF_TARGET_COUNT)
+    target_weights = target_weights_for_selection(selected, previous_by_code)
     holdings = []
     rebalance = []
     total_unrealized = 0.0
@@ -447,6 +972,7 @@ def build_ai_etf_portfolio(
         item = result.get("raw") or {}
         previous = previous_by_code.get(code, {})
         previous_weight = number(value_from_mapping(previous, "target_weight_pct", "targetWeightPct")) or 0.0
+        target_weight = target_weights[code]
         reference_price = result_close_price(result)
         simulated_notional = AI_ETF_INITIAL_NOTIONAL * target_weight / 100.0
         simulated_quantity = simulated_notional / reference_price if reference_price else None
@@ -461,6 +987,10 @@ def build_ai_etf_portfolio(
         delta = round_weight(target_weight - previous_weight)
         action = normalized_action(previous_weight, target_weight)
         turnover += abs(delta)
+        if action == "hold" and previous_quantity:
+            simulated_quantity = previous_quantity
+            simulated_notional = simulated_quantity * reference_price if reference_price else AI_ETF_INITIAL_NOTIONAL * target_weight / 100.0
+        action_detail = "继续保留，已经通过观察期和中长期质量筛选。" if code in previous_by_code else None
         holding = {
             "portfolioName": AI_ETF_PORTFOLIO_NAME,
             "tradeDate": trade_date,
@@ -484,9 +1014,11 @@ def build_ai_etf_portfolio(
             "longTermScore": int_number(horizon_value(result, "long_term", "score")),
             "longTermSignalLabel": horizon_value(result, "long_term", "signal"),
             "confidence": result.get("confidence"),
-            "rationale": holding_rationale(result, action),
+            "rationale": holding_rationale(result, action) if not action_detail else f"{action_detail} {holding_rationale(result, action)}",
             "risks": item.get("risks") or [],
             "rankScore": round(ai_etf_rank_score(result), 4),
+            "firstHeldDate": previous_first_held_date(previous, trade_date) if previous else trade_date,
+            "holdingDays": previous_holding_days(previous, trade_date) if previous else 0,
         }
         holdings.append(holding)
         rebalance.append(
@@ -496,15 +1028,22 @@ def build_ai_etf_portfolio(
                 "targetWeightPct": holding["targetWeightPct"],
                 "weightDeltaPct": holding["weightDeltaPct"],
                 "referencePrice": reference_price,
-                "simulatedQuantityDelta": simulated_quantity if action in {"buy", "increase"} else 0,
-                "simulatedNotionalDelta": simulated_notional * (delta / target_weight) if target_weight else 0,
+                "simulatedQuantityDelta": (
+                    simulated_quantity
+                    if action == "buy"
+                    else (simulated_quantity or 0.0) - previous_quantity
+                    if action in {"increase", "reduce"}
+                    else 0.0
+                ),
+                "simulatedNotionalDelta": AI_ETF_INITIAL_NOTIONAL * delta / 100.0,
                 "realizedPnl": 0.0,
                 "realizedReturnPct": 0.0,
-                "reason": action_reason(action, result),
+                "reason": action_reason(action, result, action_detail),
             }
         )
 
     selected_codes = {holding["stockCode"] for holding in holdings}
+    result_by_code = {str(result.get("code")): result for result in candidates}
     for code, previous in previous_by_code.items():
         if code in selected_codes:
             continue
@@ -513,11 +1052,17 @@ def build_ai_etf_portfolio(
             continue
         previous_price = number(value_from_mapping(previous, "reference_price", "referencePrice"))
         previous_quantity = number(value_from_mapping(previous, "simulated_quantity", "simulatedQuantity")) or 0.0
-        reference_price = previous_price
-        realized_pnl = 0.0
+        current_result = result_by_code.get(code)
+        reference_price = result_close_price(current_result) if current_result else previous_price
+        realized_pnl = (
+            (reference_price - previous_price) * previous_quantity
+            if reference_price is not None and previous_price is not None and previous_quantity
+            else 0.0
+        )
         total_realized += realized_pnl
         turnover += previous_weight
         stock_name = str(value_from_mapping(previous, "stock_name", "stockName") or "")
+        sell_reason = sell_reasons.get(code) or action_reason("sell")
         sell_entry = {
             "portfolioName": AI_ETF_PORTFOLIO_NAME,
             "tradeDate": trade_date,
@@ -541,7 +1086,7 @@ def build_ai_etf_portfolio(
             "longTermScore": None,
             "longTermSignalLabel": None,
             "confidence": None,
-            "rationale": action_reason("sell"),
+            "rationale": sell_reason,
             "risks": [],
             "rankScore": None,
         }
@@ -560,8 +1105,12 @@ def build_ai_etf_portfolio(
                 "simulatedQuantityDelta": -previous_quantity,
                 "simulatedNotionalDelta": -(AI_ETF_INITIAL_NOTIONAL * previous_weight / 100.0),
                 "realizedPnl": realized_pnl,
-                "realizedReturnPct": 0.0,
-                "reason": action_reason("sell"),
+                "realizedReturnPct": (
+                    (reference_price / previous_price - 1) * 100.0
+                    if reference_price is not None and previous_price not in {None, 0}
+                    else 0.0
+                ),
+                "reason": sell_reason,
             }
         )
         holdings.append(sell_entry)
@@ -569,9 +1118,9 @@ def build_ai_etf_portfolio(
     total_pnl = total_realized + total_unrealized
     has_previous = bool(previous_by_code)
     selection_rule = (
-        "基于上一期组合和短期20%/中期35%/长期35%/总分10%的排序调仓。"
+        "基金经理式低换手组合：保留仍合格持仓，最小持有期约束，只有中长期恶化/低置信/数据异常才卖出；新增股票需通过观察池质量筛选。"
         if has_previous
-        else "首次生成，按三周期综合评分选出10只股票，每只等权10%。"
+        else "首次建仓：从观察池中选择中期、长期均为正且数据置信度合格的10只股票，等权配置。"
     )
     return {
         "portfolioName": AI_ETF_PORTFOLIO_NAME,
@@ -592,6 +1141,21 @@ def build_ai_etf_portfolio(
             "candidateCount": len(candidates),
             "selectedCount": AI_ETF_TARGET_COUNT,
             "hasPreviousPortfolio": has_previous,
+            "retainedCount": len([holding for holding in holdings if holding["targetWeightPct"] > 0 and holding["stockCode"] in previous_by_code]),
+            "soldCount": len([holding for holding in holdings if holding["action"] == "sell"]),
+            "minHoldDays": AI_ETF_MIN_HOLD_DAYS,
+            "entryRule": {
+                "mediumTermScoreAtLeast": AI_ETF_ENTRY_MEDIUM_THRESHOLD,
+                "longTermScoreAtLeast": AI_ETF_ENTRY_LONG_THRESHOLD,
+                "confidence": "非低",
+                "sourceErrors": "无关键数据异常",
+            },
+            "sellRule": {
+                "mediumTermScoreAtOrBelow": AI_ETF_SELL_MEDIUM_THRESHOLD,
+                "longTermScoreAtOrBelow": AI_ETF_SELL_LONG_THRESHOLD,
+                "confidence": "低",
+                "sourceErrors": "任一关键异常",
+            },
         },
     }
 
@@ -856,6 +1420,145 @@ def signal_outcome_statements(result: dict[str, Any], adjust_type: str) -> list[
     return [signal_outcome_statement(spec, result) for spec in signal_accuracy.outcome_specs(result, adjust_type)]
 
 
+def previous_score_by_code(previous_scores: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in previous_scores or []:
+        code = str(value_from_mapping(row, "stock_code", "stockCode") or "")
+        if code:
+            grouped[code] = row
+    return grouped
+
+
+def stability_break_detected(result: dict[str, Any], horizon: str) -> bool:
+    if result.get("confidence") == "低" or result.get("source_errors"):
+        return True
+    if horizon == "medium_term":
+        r20 = trend_window_return(result, 20)
+        r60 = trend_window_return(result, 60)
+        return bool(
+            (r20 is not None and r20 <= -10)
+            or (r60 is not None and r60 <= -15)
+            or ai_etf_horizon_score(result, "short_term") <= -50
+        )
+    if horizon == "long_term":
+        r60 = trend_window_return(result, 60)
+        r120 = trend_window_return(result, 120)
+        return bool((r60 is not None and r60 <= -18) or (r120 is not None and r120 <= -25))
+    return False
+
+
+def damp_score_change(previous_score: Any, current_score: Any, max_delta: int) -> int | None:
+    previous_numeric = int_number(previous_score)
+    current_numeric = int_number(current_score)
+    if previous_numeric is None or current_numeric is None:
+        return current_numeric
+    delta = current_numeric - previous_numeric
+    if abs(delta) <= max_delta:
+        return current_numeric
+    return previous_numeric + (max_delta if delta > 0 else -max_delta)
+
+
+def add_stability_part(
+    result: dict[str, Any],
+    horizon: str,
+    previous_day_score: int,
+    raw_score: int,
+    adjusted_score: int,
+) -> None:
+    horizon_info = (result.get("horizon_scores") or {}).get(horizon) or {}
+    label = str(horizon_info.get("label") or horizon)
+    parts = horizon_info.setdefault("parts", [])
+    parts.append(
+        {
+            "module": f"{label}稳定器",
+            "points": adjusted_score - raw_score,
+            "reason": f"参考上一交易日 {previous_day_score}/100，限制中长期分数单日跳变。",
+        }
+    )
+
+
+def apply_score_stability(results: list[dict[str, Any]], previous_scores: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    previous_by_code = previous_score_by_code(previous_scores)
+    if not previous_by_code:
+        return results
+
+    for result in results:
+        previous = previous_by_code.get(str(result.get("code") or ""))
+        if not previous:
+            continue
+        applied: list[dict[str, Any]] = []
+        horizons = result.get("horizon_scores") or {}
+        for horizon, max_delta in HORIZON_STABILITY_MAX_DELTA.items():
+            horizon_info = horizons.get(horizon)
+            if not horizon_info or stability_break_detected(result, horizon):
+                continue
+            previous_score = int_number(value_from_mapping(previous, f"{horizon}_score", f"{horizon}Score"))
+            current_score = int_number(horizon_info.get("score"))
+            adjusted_score = damp_score_change(previous_score, current_score, max_delta)
+            if previous_score is None or current_score is None or adjusted_score is None or adjusted_score == current_score:
+                continue
+            horizon_info["score"] = adjusted_score
+            horizon_info["signal"] = signal_label_from_score(adjusted_score)
+            horizon_info["advice"] = horizon_advice_for_stabilized_score(horizon, adjusted_score, result.get("regime"))
+            add_stability_part(result, horizon, previous_score, current_score, adjusted_score)
+            applied.append(
+                {
+                    "horizon": horizon,
+                    "previousScore": previous_score,
+                    "rawScore": current_score,
+                    "stabilizedScore": adjusted_score,
+                    "maxDelta": max_delta,
+                }
+            )
+        previous_total = value_from_mapping(previous, "score")
+        adjusted_total = damp_score_change(previous_total, result.get("score"), TOTAL_SCORE_STABILITY_MAX_DELTA)
+        current_total = int_number(result.get("score"))
+        if adjusted_total is not None and current_total is not None and adjusted_total != current_total:
+            result["score"] = adjusted_total
+            result["signal"] = signal_label_from_score(adjusted_total)
+            applied.append(
+                {
+                    "horizon": "overall",
+                    "previousScore": int_number(previous_total),
+                    "rawScore": current_total,
+                    "stabilizedScore": adjusted_total,
+                    "maxDelta": TOTAL_SCORE_STABILITY_MAX_DELTA,
+                }
+            )
+        if applied:
+            result.setdefault("stability_adjustments", []).extend(applied)
+    return results
+
+
+def horizon_advice_for_stabilized_score(horizon: str, score: int, regime: Any) -> str:
+    regime_text = str(regime or "mixed")
+    if horizon == "short_term":
+        if score >= 50:
+            return "短期动能和环境配合，可考虑顺势但需要严格止损。"
+        if score >= 15:
+            return "短期有买入偏向，更适合小仓位试探或等待放量确认。"
+        if score > -15:
+            return "短期信号不够一致，等待突破、回踩或动能修复。"
+        return "短期风险偏高，先回避追涨或降低仓位。"
+    if horizon == "medium_term":
+        if score >= 50:
+            return "中期趋势和质量配合，适合分批配置并跟踪关键均线。"
+        if score >= 15:
+            return "中期偏正向，可分批跟踪，等待趋势继续确认。"
+        if score > -15:
+            return "中期证据混合，观察 20/60/120 日趋势是否重新同向。"
+        return "中期偏弱，除非重新站回关键均线并改善量价结构。"
+    if score >= 50:
+        return "长期质量和趋势较强，适合纳入长期观察或分批配置池。"
+    if score >= 15:
+        return "长期有正向基础，但仍要结合估值、安全边际和仓位管理。"
+    if score > -15:
+        return "长期吸引力不足，等待基本面或长期趋势给出更清晰证据。"
+    if regime_text == "downtrend":
+        return "长期趋势偏弱，优先等待长期结构修复。"
+    return "长期风险收益不占优，暂不适合提高配置权重。"
+
+
 def refresh_signal_outcomes_sql() -> str:
     return """
 UPDATE stock_signal_outcome outcome
@@ -1094,6 +1797,7 @@ def build_persist_sql(
     adjust_type: str,
     include_reports: bool = True,
     previous_ai_etf_holdings: list[dict[str, Any]] | None = None,
+    include_ai_etf: bool = True,
 ) -> str:
     statements = ["SET NAMES utf8mb4;", "START TRANSACTION;"]
     persisted_codes = []
@@ -1116,8 +1820,9 @@ def build_persist_sql(
         if include_reports:
             statements.append(report_statement(result, adjust_type))
 
-    portfolio = build_ai_etf_portfolio(results, adjust_type, previous_ai_etf_holdings)
-    statements.extend(ai_etf_statements(portfolio))
+    if include_ai_etf:
+        portfolio = build_ai_etf_portfolio(results, adjust_type, previous_ai_etf_holdings)
+        statements.extend(ai_etf_statements(portfolio))
 
     message = f"已写入 {len(persisted_codes)} 只股票的每日分析数据"
     statements.append(
@@ -1203,7 +1908,8 @@ SELECT
   target_weight_pct,
   reference_price,
   simulated_quantity,
-  simulated_notional
+  simulated_notional,
+  raw_json
 FROM stock_ai_etf_holding
 WHERE portfolio_name = {sql_text(AI_ETF_PORTFOLIO_NAME)}
   AND adjust_type = {sql_text(adjust_type)}
@@ -1223,8 +1929,15 @@ ORDER BY stock_code;
         if not line.strip():
             continue
         cells = line.split("\t")
-        if len(cells) != 7:
+        if len(cells) != 8:
             continue
+        raw_json = {}
+        raw_text = parse_mysql_nullable(cells[7])
+        if raw_text:
+            try:
+                raw_json = json.loads(raw_text)
+            except json.JSONDecodeError:
+                raw_json = {}
         holdings.append(
             {
                 "stock_code": cells[0],
@@ -1234,9 +1947,115 @@ ORDER BY stock_code;
                 "reference_price": number(parse_mysql_nullable(cells[4])),
                 "simulated_quantity": number(parse_mysql_nullable(cells[5])),
                 "simulated_notional": number(parse_mysql_nullable(cells[6])),
+                "trade_date": raw_json.get("firstHeldDate") or raw_json.get("tradeDate"),
+                "first_held_date": raw_json.get("firstHeldDate") or raw_json.get("tradeDate"),
             }
         )
     return holdings
+
+
+def fetch_latest_signal_scores(args: argparse.Namespace, trade_date: str, adjust_type: str) -> list[dict[str, Any]]:
+    if not trade_date:
+        return []
+    sql = f"""
+SELECT
+  stock_code,
+  score,
+  short_term_score,
+  medium_term_score,
+  long_term_score
+FROM stock_daily_signal_score
+WHERE adjust_type = {sql_text(adjust_type)}
+  AND trade_date = (
+    SELECT MAX(trade_date)
+    FROM stock_daily_signal_score
+    WHERE adjust_type = {sql_text(adjust_type)}
+      AND trade_date < {sql_date(trade_date)}
+  )
+ORDER BY stock_code;
+"""
+    output = query_mysql(sql, args, use_database=True)
+    rows = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        cells = line.split("\t")
+        if len(cells) != 5:
+            continue
+        rows.append(
+            {
+                "stock_code": cells[0],
+                "score": number(parse_mysql_nullable(cells[1])),
+                "short_term_score": number(parse_mysql_nullable(cells[2])),
+                "medium_term_score": number(parse_mysql_nullable(cells[3])),
+                "long_term_score": number(parse_mysql_nullable(cells[4])),
+            }
+        )
+    return rows
+
+
+def fetch_historical_signal_scores(
+    args: argparse.Namespace,
+    stock_codes: list[str],
+    trade_date: str,
+    adjust_type: str,
+    limit: int = HISTORICAL_SCORE_LOOKBACK_ROWS,
+) -> dict[str, list[dict[str, Any]]]:
+    if not stock_codes or not trade_date:
+        return {}
+    code_list = ", ".join(sql_text(code) for code in sorted(set(stock_codes)))
+    sql = f"""
+SELECT
+  stock_code,
+  DATE_FORMAT(trade_date, '%Y-%m-%d') AS trade_date,
+  score,
+  short_term_score,
+  medium_term_score,
+  long_term_score,
+  horizon_scores_json,
+  score_parts_json,
+  raw_analysis_json
+FROM (
+  SELECT
+    stock_code,
+    trade_date,
+    score,
+    short_term_score,
+    medium_term_score,
+    long_term_score,
+    horizon_scores_json,
+    score_parts_json,
+    raw_analysis_json,
+    ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY trade_date DESC) AS row_rank
+  FROM stock_daily_signal_score
+  WHERE adjust_type = {sql_text(adjust_type)}
+    AND trade_date < {sql_date(trade_date)}
+    AND stock_code IN ({code_list})
+) ranked_scores
+WHERE row_rank <= {int(limit)}
+ORDER BY stock_code, trade_date;
+"""
+    output = query_mysql(sql, args, use_database=True)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        cells = line.split("\t")
+        if len(cells) != 9:
+            continue
+        row = {
+            "stock_code": cells[0],
+            "trade_date": cells[1],
+            "score": number(parse_mysql_nullable(cells[2])),
+            "short_term_score": number(parse_mysql_nullable(cells[3])),
+            "medium_term_score": number(parse_mysql_nullable(cells[4])),
+            "long_term_score": number(parse_mysql_nullable(cells[5])),
+            "horizon_scores_json": parse_json_value(parse_mysql_nullable(cells[6]), {}),
+            "score_parts_json": parse_json_value(parse_mysql_nullable(cells[7]), []),
+            "raw_analysis_json": parse_json_value(parse_mysql_nullable(cells[8]), {}),
+        }
+        grouped.setdefault(cells[0], []).append(row)
+    return grouped
 
 
 def fetch_evaluation_summaries(args: argparse.Namespace, stock_codes: list[str], adjust_type: str) -> dict[str, Any]:
@@ -1339,6 +2158,15 @@ def filter_new_trade_date_results(
     return filtered
 
 
+def group_results_by_trade_date(results: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for result in results:
+        trade_date = analysis_trade_date(result)
+        if trade_date:
+            grouped.setdefault(trade_date, []).append(result)
+    return grouped
+
+
 def analyze_results(args: argparse.Namespace, scorer: Any) -> list[dict[str, Any]]:
     items = fetch_analysis_items(args)
     total = len(items)
@@ -1356,23 +2184,44 @@ def analyze_results(args: argparse.Namespace, scorer: Any) -> list[dict[str, Any
 
 def persist_results(results: list[dict[str, Any]], args: argparse.Namespace) -> None:
     trade_dates = sorted({analysis_trade_date(result) for result in results if analysis_trade_date(result)})
-    previous_holdings = fetch_latest_ai_etf_holdings(args, trade_dates[-1], args.adjust) if trade_dates else []
+    latest_trade_date = trade_dates[-1] if trade_dates else ""
+    stock_codes = [str(result["code"]) for result in results]
+    for trade_date, date_results in group_results_by_trade_date(results).items():
+        previous_scores = fetch_latest_signal_scores(args, trade_date, args.adjust)
+        apply_score_stability(date_results, previous_scores)
+        date_stock_codes = [str(result["code"]) for result in date_results]
+        historical_scores = fetch_historical_signal_scores(args, date_stock_codes, trade_date, args.adjust)
+        apply_historical_score_context(date_results, historical_scores)
+    previous_holdings = fetch_latest_ai_etf_holdings(args, latest_trade_date, args.adjust) if latest_trade_date else []
     run_mysql(
         build_persist_sql(
             results,
             args.adjust,
             include_reports=False,
             previous_ai_etf_holdings=previous_holdings,
+            include_ai_etf=not bool(getattr(args, "batch_size", None)),
         ),
         args,
         use_database=True,
     )
     run_mysql(refresh_signal_outcomes_sql(), args, use_database=True)
-    stock_codes = [str(result["code"]) for result in results]
     summaries = fetch_evaluation_summaries(args, stock_codes, args.adjust)
     for result in results:
         result["evaluation_summary"] = summaries.get(str(result["code"]), signal_accuracy.empty_summary())
     run_mysql(build_report_sql(results, args.adjust), args, use_database=True)
+
+
+def persist_ai_etf_for_results(results: list[dict[str, Any]], args: argparse.Namespace) -> None:
+    trade_dates = sorted({analysis_trade_date(result) for result in results if analysis_trade_date(result)})
+    if not trade_dates:
+        return
+    trade_date = trade_dates[-1]
+    previous_holdings = fetch_latest_ai_etf_holdings(args, trade_date, args.adjust)
+    portfolio = build_ai_etf_portfolio(results, args.adjust, previous_holdings)
+    statements = ["SET NAMES utf8mb4;", "START TRANSACTION;"]
+    statements.extend(ai_etf_statements(portfolio))
+    statements.append("COMMIT;")
+    run_mysql("\n\n".join(statements) + "\n", args, use_database=True)
 
 
 def upload_results(
@@ -1380,9 +2229,13 @@ def upload_results(
     args: argparse.Namespace,
     adjust_type: str,
     ai_etf: dict[str, Any] | None = None,
+    build_ai_etf: bool = False,
 ) -> dict[str, Any]:
     token = getattr(args, "ingest_token", "") or os.environ.get("INGEST_API_TOKEN", "") or DEFAULT_INGEST_API_TOKEN
-    payload = json.dumps({"adjustType": adjust_type, "results": results, "aiEtf": ai_etf}, ensure_ascii=False).encode("utf-8")
+    payload_data = {"adjustType": adjust_type, "results": results, "aiEtf": ai_etf}
+    if build_ai_etf:
+        payload_data["buildAiEtf"] = True
+    payload = json.dumps(payload_data, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         getattr(args, "ingest_url"),
         data=payload,
@@ -1513,11 +2366,13 @@ def main(argv: list[str]) -> int:
         dry_run_parts: list[str] = []
         resolved_codes = sfa.resolve_input_codes(args.codes, args.codes_file) if args.batch_size else None
         code_names = {} if args.codes or not args.batch_size else sfa.load_code_names_from_file(args.codes_file)
+        pending_ai_etf_results: list[dict[str, Any]] = []
         for as_of_date in as_of_dates:
             run_args = argparse.Namespace(**vars(args))
             run_args.as_of_date = as_of_date
             batches = chunked(resolved_codes, args.batch_size) if resolved_codes is not None else [None]
             date_had_results = False
+            date_results: list[dict[str, Any]] = []
             for batch_index, batch_codes in enumerate(batches, start=1):
                 if batch_codes is not None:
                     run_args = argparse.Namespace(**vars(args))
@@ -1536,8 +2391,7 @@ def main(argv: list[str]) -> int:
                 elif args.ingest_url:
                     batch_label = f"第 {batch_index}/{len(batches)} 批，" if batch_codes is not None else ""
                     log_status(args, f"开始上报生产 ingest：{batch_label}{len(results)} 条结果")
-                    ai_etf = build_ai_etf_portfolio(results, args.adjust)
-                    upload_response = upload_results(results, run_args, args.adjust, ai_etf=ai_etf)
+                    upload_response = upload_results(results, run_args, args.adjust)
                     persisted_count = upload_response.get("persistedCount")
                     suffix = f"，persistedCount={persisted_count}" if persisted_count is not None else ""
                     log_status(args, f"生产 ingest 上报完成{suffix}")
@@ -1547,9 +2401,23 @@ def main(argv: list[str]) -> int:
                     persist_results(results, run_args)
                     log_status(args, "本地 MySQL 写入完成")
                 all_results.extend(results)
+                date_results.extend(results)
             if not date_had_results:
                 label = f"{as_of_date:%Y-%m-%d}" if as_of_date else "本次运行"
                 print(f"{label} 无新的交易日快照，已跳过")
+                continue
+            if args.ingest_url:
+                pending_ai_etf_results.extend(date_results)
+            elif not args.dry_run and args.batch_size:
+                log_status(args, f"开始统一生成本地 AI ETF：{len(date_results)} 条候选")
+                persist_ai_etf_for_results(date_results, run_args)
+                log_status(args, "本地 AI ETF 组合更新完成")
+        if args.ingest_url and pending_ai_etf_results:
+            log_status(args, f"开始触发生产 AI ETF 组合构建：{len(pending_ai_etf_results)} 条候选")
+            upload_response = upload_results([], args, args.adjust, build_ai_etf=True)
+            ai_etf_result = upload_response.get("aiEtf")
+            suffix = f"，holdingCount={ai_etf_result.get('holdingCount')}" if ai_etf_result else ""
+            log_status(args, f"生产 AI ETF 组合构建完成{suffix}")
         if args.dry_run:
             print("\n".join(dry_run_parts), end="")
             return 0
